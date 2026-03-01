@@ -26,7 +26,7 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-NATIVE_HANDOFF_CACHE_VERSION = 4
+NATIVE_HANDOFF_CACHE_VERSION = 5
 INITIAL_COMPATIBILITY_SCORE = 0.2
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {"0", "false", "False"}
 MODEL_ID = "labs-mistral-small-creative"
@@ -247,6 +247,11 @@ class WebHandoffOutput(BaseModel):
     sources: list[SourceItem] = Field(description="Citations used.")
 
 
+class SentimentResult(BaseModel):
+    input_score: float = Field(description="Sentiment score for the user input, from -1.0 (very negative) to 1.0 (very positive).")
+    response_score: float = Field(description="Sentiment score for the agent response, from -1.0 (very negative) to 1.0 (very positive).")
+
+
 @dataclass
 class MistralCaller:
     api_key: str | None = None
@@ -314,6 +319,27 @@ class MistralCaller:
                     raise
                 time.sleep(_backoff_delay(attempt, _is_rate_limited(exc)))
         raise RuntimeError("Unreachable retry loop exit.")
+
+    def sentiment_score(self, input_text: str, response_text: str) -> tuple[float, float]:
+        """Score sentiment of both texts via mistral-small-latest. Falls back to word-list on failure."""
+        try:
+            system = (
+                "You are a sentiment analysis model. "
+                "Rate the emotional sentiment of each text on a scale from -1.0 (very negative) to 1.0 (very positive). "
+                "Consider tone, sarcasm, context, and nuance. Return JSON with input_score and response_score."
+            )
+            parsed, _, _ = self.call_parse(
+                model="mistral-small-latest",
+                system=system,
+                payload={"input_text": input_text, "response_text": response_text},
+                schema=SentimentResult,
+                temperature=0.0,
+            )
+            input_sent = _clamp(parsed.input_score, -1.0, 1.0)
+            response_sent = _clamp(parsed.response_score, -1.0, 1.0)
+            return input_sent, response_sent
+        except Exception:
+            return _sentiment_score(input_text), _sentiment_score(response_text)
 
     def _completion_args_json_schema(self, schema_name: str, schema_model: type[BaseModel]) -> dict[str, Any]:
         return {
@@ -439,7 +465,8 @@ class MistralCaller:
             "- Use push-pull dynamics: give warmth then pull back to create intrigue. "
             "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
             "hostile_input, memory_candidates, and handoff_hints. "
-            "Use web_search tool directly when factual lookup is useful. "
+            "Only use web_search when the user asks a clearly factual question (e.g. 'What is X?', 'Who invented Y?'). "
+            "NEVER use web_search for conversational questions like 'What about you?' or casual chat. "
             "ALWAYS handoff to the seduction specialist for coaching — treat them as your wingman. "
             "Respect handoff_hints: if consult_seduction is true, you MUST handoff. "
             "If hostile_input is true, de-escalate with warmth and humor, then re-engage. "
@@ -642,6 +669,7 @@ class MemoryStore:
         memory_used: bool,
         seduction_used: bool,
         web_used: bool,
+        caller: "MistralCaller | None" = None,
     ) -> dict[str, Any]:
         data = self._load()
         bucket = self._agent_bucket(data, session_id, owner)
@@ -653,8 +681,11 @@ class MemoryStore:
             state = bucket.get("relationship", {})
 
         turns = int(state.get("turns", 0)) + 1
-        input_sent = _sentiment_score(input_text)
-        output_sent = _sentiment_score(response_text)
+        if caller is not None:
+            input_sent, output_sent = caller.sentiment_score(input_text, response_text)
+        else:
+            input_sent = _sentiment_score(input_text)
+            output_sent = _sentiment_score(response_text)
 
         warmth_bonus = 0.06 if seduction_used else 0.0
         curiosity_bonus = 0.05 if "?" in response_text else 0.0
@@ -1403,6 +1434,7 @@ def run_turn_native(
         memory_used=memory_called,
         seduction_used="seduction" in called_tools,
         web_used="web_search" in called_tools,
+        caller=caller,
     )
     total_ms = round((time.perf_counter() - turn_t0) * 1000, 1)
 
@@ -1707,6 +1739,7 @@ def run_turn(
         memory_used=memory_called,
         seduction_used=any(c["tool"] == "seduction" and c.get("called") for c in tool_calls),
         web_used=plan.use_web_search,
+        caller=caller,
     )
 
     result = {

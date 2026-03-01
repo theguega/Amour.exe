@@ -137,10 +137,77 @@
                     transform: scale(1);
                 }
             }
+
+            .sentiment-bar {
+                position: absolute;
+                left: 10px;
+                bottom: 10px;
+                width: 28px;
+                height: 200px;
+                background: rgba(0, 0, 0, 0.5);
+                border: 2px solid #000;
+                border-radius: 14px;
+                overflow: hidden;
+                z-index: 150;
+                display: flex;
+                flex-direction: column;
+                justify-content: flex-end;
+            }
+
+            .sentiment-fill {
+                width: 100%;
+                height: 20%;
+                background: linear-gradient(to top, #ff4d6d, #ff758f, #ff8fa3);
+                border-radius: 0 0 12px 12px;
+                transition: height 1s ease-in-out;
+                position: relative;
+            }
+
+            .sentiment-fill.high {
+                background: linear-gradient(to top, #e5383b, #ff4d6d, #ff758f);
+                box-shadow: 0 0 12px rgba(255, 77, 109, 0.6);
+            }
+
+            .sentiment-icon {
+                position: absolute;
+                left: 10px;
+                bottom: 218px;
+                font-size: 22px;
+                z-index: 151;
+                filter: drop-shadow(0 0 4px rgba(0,0,0,0.8));
+                transition: transform 0.3s ease;
+            }
+
+            .sentiment-icon.pulse {
+                animation: heartPulse 0.6s ease-in-out;
+            }
+
+            @keyframes heartPulse {
+                0%, 100% { transform: scale(1); }
+                50% { transform: scale(1.4); }
+            }
+
+            .sentiment-label {
+                position: absolute;
+                left: 6px;
+                bottom: 244px;
+                font-size: 9px;
+                color: #ccc;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                z-index: 151;
+                font-weight: bold;
+            }
         </style>
     </head>
     <body>
         <div class="room-container">
+            <div class="sentiment-label">Love</div>
+            <div class="sentiment-icon" id="sentimentIcon">&#x2764;&#xFE0F;</div>
+            <div class="sentiment-bar">
+                <div class="sentiment-fill" id="sentimentFill"></div>
+            </div>
+
             <div class="character idle" id="character"></div>
 
             <div class="speech-bubble" id="typingBubble">
@@ -161,6 +228,8 @@
             const typingBubble = document.getElementById("typingBubble");
             const dots = document.getElementById("dots");
             const speechText = document.getElementById("speechText");
+            const sentimentFill = document.getElementById("sentimentFill");
+            const sentimentIcon = document.getElementById("sentimentIcon");
 
             function setCharacterState(state) {
                 character.classList.remove("idle", "talking", "thinking");
@@ -186,7 +255,7 @@
                     } else if (data.action === "speech") {
                         setCharacterState("talking");
                         showSpeech(data.text);
-                        
+
                         // Switch back to idle after some time (rough estimate based on text length)
                         const duration = Math.max(2000, data.text.length * 50);
                         setTimeout(() => {
@@ -194,6 +263,8 @@
                                 setCharacterState("idle");
                             }
                         }, duration);
+                    } else if (data.action === "sentiment") {
+                        updateSentiment(data.compatibility, data.stage);
                     }
                 };
 
@@ -222,6 +293,20 @@
                 speechText.innerText = text;
                 speechText.style.display = "block";
                 typingBubble.style.display = "flex";
+            }
+
+            function updateSentiment(compatibility, stage) {
+                const pct = Math.max(0, Math.min(100, compatibility * 100));
+                sentimentFill.style.height = pct + "%";
+                if (pct >= 60) {
+                    sentimentFill.classList.add("high");
+                } else {
+                    sentimentFill.classList.remove("high");
+                }
+                // Pulse the heart icon on update
+                sentimentIcon.classList.remove("pulse");
+                void sentimentIcon.offsetWidth;
+                sentimentIcon.classList.add("pulse");
             }
 
             connectWebSocket();

@@ -225,7 +225,14 @@ async def run_voice_loop(args) -> None:
         _append_jsonl(Path(args.log_file), result)
 
         reply = result["response"]
+        rel = result.get("relationship", {})
         await broadcast({"action": "speech", "text": reply})
+        await broadcast({
+            "action": "sentiment",
+            "compatibility": rel.get("compatibility_score", 0.2),
+            "stage": rel.get("stage", "strangers"),
+            "trend": rel.get("trend", "stable"),
+        })
         _print_turn("agent", result)
 
         print("[tts] generating audio...")
@@ -286,6 +293,14 @@ async def run_duplex_loop(args) -> None:
         _append_jsonl(Path(args.log_file), result)
         print(f"[duplex] turn={turn_idx} agent={current_agent} elapsed_ms={turn_ms}")
         _print_turn(current_agent, result)
+
+        rel = result.get("relationship", {})
+        await broadcast({
+            "action": "sentiment",
+            "compatibility": rel.get("compatibility_score", 0.2),
+            "stage": rel.get("stage", "strangers"),
+            "trend": rel.get("trend", "stable"),
+        })
 
         incoming = result["response"]
         current_agent = "man" if current_agent == "girl" else "girl"
@@ -423,12 +438,18 @@ def _open_html(filename: str):
         print(f"Warning: HTML file not found at {html_path}")
 
 
+def _html_for_agent(agent_type: str) -> str:
+    return "guy.html" if agent_type == "man" else "girl.html"
+
+
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.starter in ["man", "girl"]:
-        html_file = "guy.html" if args.starter == "man" else "girl.html"
-        _open_html(html_file)
+    if args.duplex:
+        _open_html("girl.html")
+        _open_html("guy.html")
+    else:
+        _open_html(_html_for_agent(args.type))
 
     if args.benchmark_runs > 0:
         if not args.duplex:
