@@ -174,6 +174,60 @@ def _try_parse_json_block(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_jsonish_string_field(text: str, key: str) -> str | None:
+    # Recover `"key": "value"` even when surrounding JSON is malformed/truncated.
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
+    if not m:
+        return None
+    i = m.end() - 1  # opening quote of value
+    j = i + 1
+    escaped = False
+    while j < len(text):
+        ch = text[j]
+        if escaped:
+            escaped = False
+            j += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            j += 1
+            continue
+        if ch == '"':
+            literal = text[i : j + 1]
+            try:
+                parsed = json.loads(literal)
+                return parsed.strip() if isinstance(parsed, str) and parsed.strip() else None
+            except Exception:
+                raw = literal[1:-1]
+                raw = (
+                    raw.replace('\\"', '"')
+                    .replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\\\", "\\")
+                ).strip()
+                return raw or None
+        j += 1
+    return None
+
+
+def _recover_partial_json_payload(text: str) -> dict[str, Any] | None:
+    recovered: dict[str, Any] = {}
+    for key in (
+        "tool",
+        "reply",
+        "response",
+        "text",
+        "message",
+        "short_rationale",
+        "memory_update_candidate",
+    ):
+        value = _extract_jsonish_string_field(text, key)
+        if isinstance(value, str) and value:
+            recovered[key] = value
+    return recovered or None
+
+
 def _get_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -1199,7 +1253,10 @@ def _extract_message_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return parsed
     text = _content_to_text(event.get("content"))
-    return _try_parse_json_block(text)
+    fully_parsed = _try_parse_json_block(text)
+    if isinstance(fully_parsed, dict):
+        return fully_parsed
+    return _recover_partial_json_payload(text)
 
 
 def _event_agent_id(event: dict[str, Any]) -> str:
