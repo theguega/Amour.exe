@@ -73,9 +73,12 @@ async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> N
 
 
 def _fallback_prompt(agent_type: str) -> str:
+    """Return what the OTHER person says to open the conversation."""
     if agent_type == "girl":
-        return "Hey... I am here with you. Tell me one thing about your day."
-    return "Hi, I am listening. What are you feeling right now?"
+        # Girl receives an opener from the guy
+        return "Hey."
+    # Guy receives a cold opener from the girl — he has to work for it
+    return "Hi."
 
 
 def _print_turn(prefix: str, result: dict) -> None:
@@ -210,26 +213,35 @@ async def run_voice_loop(args) -> None:
 
     while args.max_turns <= 0 or turn_idx < args.max_turns:
         turn_idx += 1
+        t_loop_top = time.perf_counter()
         print(f"\n[turn {turn_idx}] input -> {incoming}")
 
         await broadcast({"action": "typing"})
         t_turn = time.perf_counter()
-        result = await asyncio.to_thread(
-            run_turn,
-            caller=caller,
-            memory_store=memory_store,
-            agent_type=args.type,
-            input_text=incoming,
-            session_id=args.session_id,
-            mood_profile=_mood_for(args.type, args),
-        )
-        await broadcast({"action": "stop_typing"})
+        print(f"[turn {turn_idx}] calling run_turn...")
+        try:
+            result = await asyncio.to_thread(
+                run_turn,
+                caller=caller,
+                memory_store=memory_store,
+                agent_type=args.type,
+                input_text=incoming,
+                session_id=args.session_id,
+                mood_profile=_mood_for(args.type, args),
+            )
+        except Exception as exc:
+            print(f"[turn {turn_idx}] run_turn CRASHED: {type(exc).__name__}: {exc}")
+            await broadcast({"action": "stop_typing"})
+            raise
         turn_duration = time.perf_counter() - t_turn
+        print(f"[turn {turn_idx}] run_turn done in {turn_duration:.2f}s")
+        await broadcast({"action": "stop_typing"})
         log_to_weave_fn(result, turn_duration)
         _append_jsonl(Path(args.log_file), result)
 
         reply = result["response"]
         rel = result.get("relationship", {})
+        print(f"[turn {turn_idx}] reply ({len(reply)} chars): {reply[:120]}...")
         await broadcast({"action": "speech", "text": reply})
         await broadcast({
             "action": "sentiment",
@@ -239,30 +251,48 @@ async def run_voice_loop(args) -> None:
         })
         _print_turn("agent", result)
 
-        print("[tts] generating audio...")
-        audio_path = text_to_audio(reply, VOICE_IDS[args.type])
-        print(f"[tts] file={audio_path}")
-        await play_audio(audio_path)
+        t_tts = time.perf_counter()
+        print(f"[turn {turn_idx}] generating TTS audio...")
+        try:
+            audio_path = text_to_audio(reply, VOICE_IDS[args.type])
+        except Exception as exc:
+            print(f"[turn {turn_idx}] TTS CRASHED: {type(exc).__name__}: {exc}")
+            raise
+        print(f"[turn {turn_idx}] TTS done in {time.perf_counter() - t_tts:.2f}s -> {audio_path}")
 
-        # After speaking, wait a bit before hiding bubble, or hide it now?
-        # Maybe hide it after audio finishes?
-        await broadcast({"action": "stop_typing"})  # Ensure it's hidden after speaking
+        t_play = time.perf_counter()
+        await play_audio(audio_path)
+        print(f"[turn {turn_idx}] audio playback done in {time.perf_counter() - t_play:.2f}s")
+
+        await broadcast({"action": "stop_typing"})
+
+        print(f"[turn {turn_idx}] total turn time: {time.perf_counter() - t_loop_top:.2f}s")
 
         if args.auto:
-            print(f"[auto] waiting {args.auto_delay}s before listening...")
+            print(f"[turn {turn_idx}] auto-waiting {args.auto_delay}s before listening...")
             await asyncio.sleep(args.auto_delay)
         else:
+            print(f"[turn {turn_idx}] waiting for spacebar...")
             await wait_for_spacebar()
-        print("[stt] listening for the other agent/user...")
-        transcribed_text = await listen_and_transcribe(
-            silence_timeout_s=stt_silence,
-            noise_calibration_s=args.noise_calibration_s,
-            speech_ratio=args.speech_ratio,
-        )
+
+        print(f"[turn {turn_idx}] starting STT...")
+        t_stt = time.perf_counter()
+        try:
+            transcribed_text = await listen_and_transcribe(
+                silence_timeout_s=stt_silence,
+                noise_calibration_s=args.noise_calibration_s,
+                speech_ratio=args.speech_ratio,
+            )
+        except Exception as exc:
+            print(f"[turn {turn_idx}] STT CRASHED: {type(exc).__name__}: {exc}")
+            raise
+        print(f"[turn {turn_idx}] STT done in {time.perf_counter() - t_stt:.2f}s")
         incoming = transcribed_text.strip()
         if not incoming:
             incoming = _fallback_prompt("man" if args.type == "girl" else "girl")
-            print("[stt] empty input detected, using fallback prompt.")
+            print(f"[turn {turn_idx}] empty STT input, using fallback: {incoming}")
+        else:
+            print(f"[turn {turn_idx}] heard: {incoming}")
 
 
 async def run_duplex_loop(args) -> None:
