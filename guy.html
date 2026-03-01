@@ -222,6 +222,7 @@
 
         <script>
             const wsUrl = "ws://localhost:8080";
+            const OWN_AGENT = "man";
             let ws;
 
             const character = document.getElementById("character");
@@ -247,31 +248,28 @@
                     const data = JSON.parse(event.data);
 
                     if (data.action === "typing") {
+                        if (data.agent_type && data.agent_type !== OWN_AGENT) return;
                         setCharacterState("thinking");
                         showTypingBubble();
                     } else if (data.action === "stop_typing") {
+                        if (data.agent_type && data.agent_type !== OWN_AGENT) return;
                         setCharacterState("idle");
                         hideTypingBubble();
                     } else if (data.action === "speech") {
-                        // Simulate reading + thinking delay before responding
-                        setCharacterState("thinking");
-                        showTypingBubble();
-                        const thinkDelay = Math.max(1500, Math.min(4000, data.text.length * 30));
-                        setTimeout(() => {
-                            setCharacterState("talking");
-                            showSpeech(data.text);
+                        if (data.agent_type && data.agent_type !== OWN_AGENT) return;
+                        // Render speech immediately to avoid timing races during replay/live demos
+                        setCharacterState("talking");
+                        showSpeech(data.text);
 
-                            // Switch back to idle after speech duration
-                            const duration = Math.max(2000, data.text.length * 50);
-                            setTimeout(() => {
-                                if (character.classList.contains("talking")) {
-                                    setCharacterState("idle");
-                                }
-                            }, duration);
-                        }, thinkDelay);
+                        const duration = Math.max(1800, data.text.length * 45);
+                        setTimeout(() => {
+                            if (character.classList.contains("talking")) {
+                                setCharacterState("idle");
+                            }
+                        }, duration);
                     } else if (data.action === "sentiment") {
                         const agentType = data.agent_type;
-                        if (agentType !== "man") return;
+                        if (agentType && agentType !== OWN_AGENT) return;
                         updateSentiment(data.compatibility, data.stage);
                     }
                 };

@@ -50,28 +50,6 @@ async def play_audio(audio_path: Path) -> None:
         await asyncio.sleep(0.1)
     pygame.mixer.quit()
 
-
-async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> None:
-    import sys
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    print(prompt, flush=True)
-    loop = asyncio.get_running_loop()
-    try:
-        tty.setraw(fd)
-        while True:
-            ch = await loop.run_in_executor(None, sys.stdin.read, 1)
-            if ch == " ":
-                break
-            if ch in ("\x03", "\x1b"):
-                raise KeyboardInterrupt
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
 async def _watch_stop_key(stop_event: asyncio.Event, key: str = "b") -> None:
     """Listen for a key press in raw terminal mode and set stop_event when pressed."""
     import sys
@@ -234,7 +212,7 @@ async def run_voice_loop(args) -> None:
         t_loop_top = time.perf_counter()
         print(f"\n[turn {turn_idx}] input -> {incoming}")
 
-        await broadcast({"action": "typing"})
+        await broadcast({"action": "typing", "agent_type": args.type})
         t_turn = time.perf_counter()
         print(f"[turn {turn_idx}] calling run_turn...")
         try:
@@ -249,18 +227,18 @@ async def run_voice_loop(args) -> None:
             )
         except Exception as exc:
             print(f"[turn {turn_idx}] run_turn CRASHED: {type(exc).__name__}: {exc}")
-            await broadcast({"action": "stop_typing"})
+            await broadcast({"action": "stop_typing", "agent_type": args.type})
             raise
         turn_duration = time.perf_counter() - t_turn
         print(f"[turn {turn_idx}] run_turn done in {turn_duration:.2f}s")
-        await broadcast({"action": "stop_typing"})
+        await broadcast({"action": "stop_typing", "agent_type": args.type})
         log_to_weave_fn(result, turn_duration)
         _append_jsonl(Path(args.log_file), result)
 
         reply = result["response"]
         rel = result.get("relationship", {})
         print(f"[turn {turn_idx}] reply ({len(reply)} chars): {reply[:120]}...")
-        await broadcast({"action": "speech", "text": reply})
+        await broadcast({"action": "speech", "agent_type": args.type, "text": reply})
         default_compat = 0.0 if args.type == "girl" else 1.0
         await broadcast({
             "action": "sentiment",
@@ -284,14 +262,14 @@ async def run_voice_loop(args) -> None:
         await play_audio(audio_path)
         print(f"[turn {turn_idx}] audio playback done in {time.perf_counter() - t_play:.2f}s")
 
-        await broadcast({"action": "stop_typing"})
+        await broadcast({"action": "stop_typing", "agent_type": args.type})
 
         print(f"[turn {turn_idx}] total turn time: {time.perf_counter() - t_loop_top:.2f}s")
 
         if args.auto:
             print(f"[turn {turn_idx}] auto-waiting {args.auto_delay}s before listening...")
             await asyncio.sleep(args.auto_delay)
-            
+
         print(f"[turn {turn_idx}] starting STT... (press B to stop listening)")
         t_stt = time.perf_counter()
         stop_event = asyncio.Event()
@@ -342,6 +320,7 @@ async def run_duplex_loop(args) -> None:
     )
     for turn_idx in range(1, turns + 1):
         print(f"\n[turn {turn_idx}] {current_agent} hears -> {incoming}")
+        await broadcast({"action": "typing", "agent_type": current_agent})
         t_turn = time.perf_counter()
         t0 = time.perf_counter()
         result = run_turn(
@@ -360,6 +339,9 @@ async def run_duplex_loop(args) -> None:
         _print_turn(current_agent, result)
 
         rel = result.get("relationship", {})
+        reply = result["response"]
+        await broadcast({"action": "stop_typing", "agent_type": current_agent})
+        await broadcast({"action": "speech", "agent_type": current_agent, "text": reply})
         default_compat = 0.0 if current_agent == "girl" else 1.0
         await broadcast({
             "action": "sentiment",
@@ -369,8 +351,169 @@ async def run_duplex_loop(args) -> None:
             "trend": rel.get("trend", "stable"),
         })
 
-        incoming = result["response"]
+        incoming = reply
         current_agent = "man" if current_agent == "girl" else "girl"
+
+
+def _normalize_agent(agent_type: str) -> str:
+    if agent_type == "guy":
+        return "man"
+    return agent_type
+
+
+def _split_replay_segments(rows: list[dict]) -> list[list[dict]]:
+    segments: list[list[dict]] = []
+    current: list[dict] = []
+    prev_turn = 0
+    for row in rows:
+        turns = int(row.get("relationship", {}).get("turns", 0) or 0)
+        if current and (turns < prev_turn or (turns <= 1 and prev_turn > 1)):
+            segments.append(current)
+            current = []
+        current.append(row)
+        prev_turn = turns
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _pick_best_segment(segments: list[list[dict]]) -> list[dict]:
+    if not segments:
+        return []
+
+    def score(seg: list[dict]) -> tuple[int, int, int, str]:
+        stages = [str(r.get("relationship", {}).get("stage", "")) for r in seg]
+        has_in_love = 1 if "in_love" in stages else 0
+        max_turn = max(int(r.get("relationship", {}).get("turns", 0) or 0) for r in seg)
+        length = len(seg)
+        last_ts = str(seg[-1].get("ts", ""))
+        return (has_in_love, max_turn, length, last_ts)
+
+    return max(segments, key=score)
+
+
+def _load_replay_rows(
+    path: Path,
+    session_id: str = "",
+    max_turns: int = 0,
+    replay_all_matches: bool = False,
+    replay_offset: int = 0,
+) -> list[dict]:
+    rows = []
+    if not path.exists():
+        raise FileNotFoundError(f"Replay log not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            if session_id and row.get("session_id") != session_id:
+                continue
+            agent_type = _normalize_agent(str(row.get("agent_type", "")))
+            if agent_type not in {"girl", "man"}:
+                continue
+            if not row.get("response"):
+                continue
+            row["agent_type"] = agent_type
+            rows.append(row)
+
+    if replay_all_matches:
+        selected = rows
+    else:
+        segments = _split_replay_segments(rows)
+        selected = _pick_best_segment(segments)
+
+    if replay_offset > 0:
+        selected = selected[replay_offset:]
+
+    if max_turns > 0:
+        selected = selected[:max_turns]
+    return selected
+
+
+async def run_replay_loop(args) -> None:
+    asyncio.create_task(start_ws_server())
+    replay_path = Path(args.replay_log_file)
+    rows = _load_replay_rows(
+        replay_path,
+        args.replay_session_id,
+        args.max_turns,
+        args.replay_all_matches,
+        args.replay_offset,
+    )
+
+    if args.replay_start_stage:
+        stages = ["strangers", "curious", "flirty", "bonded", "in_love"]
+        target = args.replay_start_stage.strip().lower()
+        if target in stages and args.replay_offset == 0:
+            target_idx = stages.index(target)
+            cut_idx = None
+            for i, row in enumerate(rows):
+                stage = str(row.get("relationship", {}).get("stage", "strangers")).lower()
+                stage_idx = stages.index(stage) if stage in stages else 0
+                if stage_idx >= target_idx:
+                    cut_idx = i
+                    break
+            if cut_idx is not None and cut_idx > 0:
+                rows = rows[cut_idx:]
+                print(f"[replay] trimmed first {cut_idx} rows; starting at stage>={target}")
+
+    if not rows:
+        raise SystemExit(
+            f"No replay turns found in {replay_path} "
+            f"(session_id={args.replay_session_id or 'any'})."
+        )
+
+    print(
+        f"[replay] rows={len(rows)} log={replay_path} "
+        f"session={args.replay_session_id or 'any'} speed={args.replay_speed}x"
+    )
+    await asyncio.sleep(max(0.0, args.replay_start_delay))
+
+    for idx, row in enumerate(rows, 1):
+        agent_type = row["agent_type"]
+        text = str(row.get("response", "")).strip()
+        if not text:
+            continue
+        rel = row.get("relationship", {})
+
+        default_compat = 0.0 if agent_type == "girl" else 1.0
+        think_s = max(
+            0.25,
+            min(1.8, (len(text) * 0.02) / max(args.replay_speed, 0.1)),
+        )
+        speak_s = max(
+            1.0,
+            min(4.0, (len(text) * 0.05) / max(args.replay_speed, 0.1)),
+        )
+        gap_s = max(0.1, args.replay_gap_s / max(args.replay_speed, 0.1))
+
+        print(
+            f"[replay turn {idx}] agent={agent_type} stage={rel.get('stage', 'strangers')} "
+            f"text_len={len(text)}"
+        )
+        await broadcast({"action": "typing", "agent_type": agent_type})
+        await asyncio.sleep(think_s)
+        await broadcast({"action": "stop_typing", "agent_type": agent_type})
+        await broadcast({"action": "speech", "agent_type": agent_type, "text": text})
+        await broadcast({
+            "action": "sentiment",
+            "agent_type": agent_type,
+            "compatibility": rel.get("compatibility_score", default_compat),
+            "stage": rel.get("stage", "strangers"),
+            "trend": rel.get("trend", "stable"),
+        })
+        await asyncio.sleep(speak_s)
+        await broadcast({"action": "stop_typing", "agent_type": agent_type})
+        await asyncio.sleep(gap_s)
+
+    print("[replay] complete")
 
 
 async def run_duplex_benchmark(args) -> None:
@@ -467,6 +610,15 @@ def parse_args():
         description="Voice runtime loop wired to amour_agent run_turn."
     )
     parser.add_argument("--type", choices=["girl", "man"], default="girl")
+    parser.add_argument("--replay", action="store_true", help="Replay a prior jsonl run over WebSocket for demo capture.")
+    parser.add_argument("--replay-log-file", default="logs/voice_runs.jsonl")
+    parser.add_argument("--replay-session-id", default="voice-session")
+    parser.add_argument("--replay-all-matches", action="store_true", help="Replay every matching row instead of auto-picking the best contiguous run.")
+    parser.add_argument("--replay-speed", type=float, default=1.5, help="Replay speed multiplier.")
+    parser.add_argument("--replay-gap-s", type=float, default=0.35, help="Base pause between replay turns.")
+    parser.add_argument("--replay-start-delay", type=float, default=1.2, help="Delay before replay starts to allow pages to connect.")
+    parser.add_argument("--replay-offset", type=int, default=0, help="Skip N replay rows from the selected run.")
+    parser.add_argument("--replay-start-stage", choices=["strangers", "curious", "flirty", "bonded", "in_love"], default="curious", help="Auto-trim replay to the first row at/after this stage (ignored when --replay-offset > 0).")
     parser.add_argument(
         "--duplex", action="store_true", help="Run both girl and man in one local loop."
     )
@@ -515,7 +667,7 @@ def _html_for_agent(agent_type: str) -> str:
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.duplex:
+    if args.replay or args.duplex:
         _open_html("girl.html")
         _open_html("guy.html")
     else:
@@ -525,6 +677,8 @@ if __name__ == "__main__":
         if not args.duplex:
             raise SystemExit("--benchmark-runs requires --duplex.")
         asyncio.run(run_duplex_benchmark(args))
+    elif args.replay:
+        asyncio.run(run_replay_loop(args))
     elif args.duplex:
         asyncio.run(run_duplex_loop(args))
     else:
