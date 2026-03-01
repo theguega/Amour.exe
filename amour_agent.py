@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 from urllib.request import urlopen
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from mistralai import Mistral
+    pass
 
 MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
@@ -28,8 +29,15 @@ MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
 NATIVE_HANDOFF_CACHE_VERSION = 4
 INITIAL_COMPATIBILITY_SCORE = 0.2
-NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {"0", "false", "False"}
+NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
+    "0",
+    "false",
+    "False",
+}
 MODEL_ID = "labs-mistral-small-creative"
+
+load_dotenv()
+WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 
 
 def _debug_native(msg: str) -> None:
@@ -130,7 +138,11 @@ def _extract_native_events(response: Any) -> list[dict[str, Any]]:
         event_type = node.get("type")
         if not isinstance(event_type, str):
             continue
-        if event_type.startswith("agent.") or event_type.startswith("tool.") or event_type.startswith("message."):
+        if (
+            event_type.startswith("agent.")
+            or event_type.startswith("tool.")
+            or event_type.startswith("message.")
+        ):
             events.append(node)
     return events
 
@@ -179,7 +191,9 @@ def _get_usage(response: Any) -> dict[str, int]:
     if usage is None:
         return {"prompt_tokens": 0, "completion_tokens": 0}
     prompt = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
-    completion = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
+    completion = (
+        getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
+    )
     return {"prompt_tokens": int(prompt), "completion_tokens": int(completion)}
 
 
@@ -196,7 +210,9 @@ class ToolPlan(BaseModel):
     seduction_reason: str = Field(description="Reason for calling or skipping seduction agent.")
     use_web_search: bool = Field(description="Whether web_search agent should be called.")
     web_search_reason: str = Field(description="Reason for calling or skipping web_search agent.")
-    web_query: str = Field(description="Web query text if web_search is needed, else a short placeholder.")
+    web_query: str = Field(
+        description="Web query text if web_search is needed, else a short placeholder."
+    )
     response_goal: str = Field(description="Primary conversational goal for this turn.")
 
 
@@ -220,21 +236,29 @@ class WebSearchResult(BaseModel):
 class FinalReply(BaseModel):
     reply: str = Field(description="Final response text to say to the lover.")
     short_rationale: str = Field(description="Brief explanation of why this response works.")
-    memory_update_candidate: str = Field(description="Potential memory fact to store from this turn.")
+    memory_update_candidate: str = Field(
+        description="Potential memory fact to store from this turn."
+    )
 
 
 class MemoryHandoffOutput(BaseModel):
     tool: str = Field(description="Tool identifier, always memory.")
-    recalled_facts: list[str] = Field(description="Relevant recalled facts from provided memory candidates.")
+    recalled_facts: list[str] = Field(
+        description="Relevant recalled facts from provided memory candidates."
+    )
     evidence: list[dict[str, Any]] = Field(description="Evidence rows linked to recalled facts.")
     important_moment: str = Field(description="Most relevant recent moment.")
     memory_confidence: float = Field(description="Confidence score in the recall quality.")
-    should_store_new_memory: bool = Field(description="Whether new memory should be persisted this turn.")
+    should_store_new_memory: bool = Field(
+        description="Whether new memory should be persisted this turn."
+    )
 
 
 class SeductionHandoffOutput(BaseModel):
     tool: str = Field(description="Tool identifier, always seduction.")
-    friend_take: str = Field(description="What a trusted friend would bluntly advise in this exact moment.")
+    friend_take: str = Field(
+        description="What a trusted friend would bluntly advise in this exact moment."
+    )
     strategy: str = Field(description="High-level strategy for this response.")
     recommended_lines: list[str] = Field(description="2-3 short line options.")
     tone_guardrails: list[str] = Field(description="Safety and tone reminders.")
@@ -256,7 +280,9 @@ class MistralCaller:
     total_calls: int = 0
     use_native_handoff: bool = True
     _native_handoff_agents: dict[str, dict[str, str]] = field(default_factory=dict)
-    native_agent_cache_file: Path = field(default_factory=lambda: Path("logs/native_handoff_agents.json"))
+    native_agent_cache_file: Path = field(
+        default_factory=lambda: Path("logs/native_handoff_agents.json")
+    )
 
     def __post_init__(self) -> None:
         from mistralai import Mistral
@@ -315,7 +341,9 @@ class MistralCaller:
                 time.sleep(_backoff_delay(attempt, _is_rate_limited(exc)))
         raise RuntimeError("Unreachable retry loop exit.")
 
-    def _completion_args_json_schema(self, schema_name: str, schema_model: type[BaseModel]) -> dict[str, Any]:
+    def _completion_args_json_schema(
+        self, schema_name: str, schema_model: type[BaseModel]
+    ) -> dict[str, Any]:
         return {
             "response_format": {
                 "type": "json_schema",
@@ -337,7 +365,9 @@ class MistralCaller:
     def _save_native_agent_cache(self, data: dict[str, Any]) -> None:
         try:
             self.native_agent_cache_file.parent.mkdir(parents=True, exist_ok=True)
-            self.native_agent_cache_file.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+            self.native_agent_cache_file.write_text(
+                json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8"
+            )
         except Exception:
             # Cache write errors should never break runtime.
             pass
@@ -365,7 +395,9 @@ class MistralCaller:
         if (
             isinstance(cached, dict)
             and cached.get("version") == NATIVE_HANDOFF_CACHE_VERSION
-            and all(isinstance(cached.get(k), str) and cached.get(k) for k in ["primary", "seduction"])
+            and all(
+                isinstance(cached.get(k), str) and cached.get(k) for k in ["primary", "seduction"]
+            )
         ):
             agents = {
                 "primary": cached["primary"],
@@ -408,7 +440,9 @@ class MistralCaller:
             name=f"amour-{agent_type}-seduction",
             description=seduction_desc,
             instructions=seduction_instr,
-            completion_args=self._completion_args_json_schema("seduction_handoff_output", SeductionHandoffOutput),
+            completion_args=self._completion_args_json_schema(
+                "seduction_handoff_output", SeductionHandoffOutput
+            ),
         )
         _debug_native(
             f"agent_type={agent_type} create seduction ms={round((time.perf_counter() - t_seduction) * 1000, 1)} id={seduction_agent.id}"
@@ -477,7 +511,9 @@ class MistralCaller:
             "seduction": agents["seduction"],
         }
         self._save_native_agent_cache(root)
-        _debug_native(f"agent_type={agent_type} bootstrap=create-done elapsed_ms={round((time.perf_counter() - t0) * 1000, 1)}")
+        _debug_native(
+            f"agent_type={agent_type} bootstrap=create-done elapsed_ms={round((time.perf_counter() - t0) * 1000, 1)}"
+        )
         return agents
 
     def call_native_handoff(
@@ -514,10 +550,16 @@ class MistralCaller:
                 return response, thinking, usage, events
             except Exception as exc:
                 message = str(exc).lower()
-                invalid_agent = "not found" in message or "unknown agent" in message or "invalid agent" in message
+                invalid_agent = (
+                    "not found" in message
+                    or "unknown agent" in message
+                    or "invalid agent" in message
+                )
                 if invalid_agent:
                     self._native_handoff_agents.pop(agent_type, None)
-                    _debug_native(f"agent_type={agent_type} invalid agent cache cleared after error={type(exc).__name__}")
+                    _debug_native(
+                        f"agent_type={agent_type} invalid agent cache cleared after error={type(exc).__name__}"
+                    )
                 if attempt == MAX_RETRIES:
                     _debug_native(
                         f"agent_type={agent_type} native_call failed attempts={attempt + 1} ensure_ms={ensure_ms} error={type(exc).__name__}"
@@ -779,7 +821,9 @@ class MemoryStore:
             "memory_confidence": confidence,
         }
 
-    def snapshot(self, session_id: str, owner: str, *, fact_limit: int = 40, message_limit: int = 12) -> dict[str, Any]:
+    def snapshot(
+        self, session_id: str, owner: str, *, fact_limit: int = 40, message_limit: int = 12
+    ) -> dict[str, Any]:
         data = self._load()
         bucket = self._agent_bucket(data, session_id, owner)
         facts = self._normalize_facts(bucket.get("facts", []))
@@ -970,7 +1014,9 @@ def _mood_instruction(agent_type: Literal["girl", "man"], mood_profile: str) -> 
     return "Current mood profile: neutral."
 
 
-def _build_seduction_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
+def _build_seduction_system(
+    agent_type: Literal["girl", "man"], mood_profile: str = "neutral"
+) -> str:
     p = _persona(agent_type)
     if agent_type == "girl":
         return "You are a friend giving brief, natural advice."
@@ -1032,7 +1078,9 @@ def _should_call_seduction(
             "flirt",
         ]
     )
-    emotional_support = any(k in t for k in ["sad", "upset", "rough day", "stressed", "lonely", "nervous"])
+    emotional_support = any(
+        k in t for k in ["sad", "upset", "rough day", "stressed", "lonely", "nervous"]
+    )
 
     if relationship_stage in {"flirty", "bonded", "in_love"}:
         return True, f"Relationship stage '{relationship_stage}' allows romantic coaching."
@@ -1152,7 +1200,9 @@ def run_turn_native(
     stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
     relationship_stage = str(stage_state.get("stage", "strangers"))
     hostile_input, hostility_reason = _detect_hostility(input_text)
-    memory_candidates = memory_store.snapshot(session_id=session_id, owner=agent_type, fact_limit=40, message_limit=12)
+    memory_candidates = memory_store.snapshot(
+        session_id=session_id, owner=agent_type, fact_limit=40, message_limit=12
+    )
     heuristic = _heuristic_plan(input_text)
     use_memory_hint, memory_hint_reason = _should_call_memory(input_text, heuristic.use_memory)
     use_seduction_hint, seduction_hint_reason = _should_call_seduction(
@@ -1186,7 +1236,9 @@ def run_turn_native(
     prep_ms = round((time.perf_counter() - prep_t0) * 1000, 1)
 
     handoff_t0 = time.perf_counter()
-    response, thinking, usage, events = caller.call_native_handoff(agent_type=agent_type, payload=payload)
+    response, thinking, usage, events = caller.call_native_handoff(
+        agent_type=agent_type, payload=payload
+    )
     handoff_ms = round((time.perf_counter() - handoff_t0) * 1000, 1)
     _ = response  # Keep for future debugging, events already extracted.
     primary_agent_id = str(caller._native_handoff_agents.get(agent_type, {}).get("primary", ""))
@@ -1252,14 +1304,18 @@ def run_turn_native(
             if isinstance(extracted, str) and extracted.strip():
                 final_reply = FinalReply(
                     reply=extracted.strip(),
-                    short_rationale=str(parsed.get("short_rationale", "Extracted from nested reply structure.")),
+                    short_rationale=str(
+                        parsed.get("short_rationale", "Extracted from nested reply structure.")
+                    ),
                     memory_update_candidate=str(parsed.get("memory_update_candidate", "")),
                 )
                 break
         elif isinstance(reply_val, str) and reply_val.strip():
             final_reply = FinalReply(
                 reply=reply_val.strip(),
-                short_rationale=str(parsed.get("short_rationale", "Extracted from partial FinalReply.")),
+                short_rationale=str(
+                    parsed.get("short_rationale", "Extracted from partial FinalReply.")
+                ),
                 memory_update_candidate=str(parsed.get("memory_update_candidate", "")),
             )
             break
@@ -1308,7 +1364,9 @@ def run_turn_native(
 
     plan = ToolPlan(
         use_memory="memory" in called_tools,
-        memory_reason="Native handoff selected memory specialist." if "memory" in called_tools else "Native handoff skipped memory specialist.",
+        memory_reason="Native handoff selected memory specialist."
+        if "memory" in called_tools
+        else "Native handoff skipped memory specialist.",
         use_seduction="seduction" in called_tools,
         seduction_reason=(
             "Native handoff selected seduction specialist."
@@ -1328,8 +1386,16 @@ def run_turn_native(
     memory_called = "memory" in called_tools
     tool_calls = [
         {"tool": "memory", "called": memory_called, "reason": plan.memory_reason},
-        {"tool": "web_search", "called": "web_search" in called_tools, "reason": plan.web_search_reason},
-        {"tool": "seduction", "called": "seduction" in called_tools, "reason": plan.seduction_reason},
+        {
+            "tool": "web_search",
+            "called": "web_search" in called_tools,
+            "reason": plan.web_search_reason,
+        },
+        {
+            "tool": "seduction",
+            "called": "seduction" in called_tools,
+            "reason": plan.seduction_reason,
+        },
     ]
 
     trace: dict[str, Any] = {
@@ -1476,7 +1542,9 @@ def run_turn(
     for _ in range(MAX_TOOL_ROUNDS):
         use_memory_now, memory_gate_reason = _should_call_memory(input_text, plan.use_memory)
         if use_memory_now:
-            mem = memory_store.recall(session_id=session_id, owner=agent_type, query=input_text, limit=3)
+            mem = memory_store.recall(
+                session_id=session_id, owner=agent_type, query=input_text, limit=3
+            )
             if mem.get("recalled_facts"):
                 strong, _ = _memory_cue_strength(input_text)
                 forget_prob = 0.03 if strong else 0.1
@@ -1628,7 +1696,9 @@ def run_turn(
             system=(
                 _build_boundary_reply_system(agent_type)
                 if hostile_input
-                else _build_reply_system_with_stage(agent_type, relationship_stage, mood_profile=mood_profile)
+                else _build_reply_system_with_stage(
+                    agent_type, relationship_stage, mood_profile=mood_profile
+                )
             ),
             payload={
                 "input_text": input_text,
@@ -1850,8 +1920,12 @@ def main() -> None:
     parser.add_argument("--session-id", default="default-couple")
     parser.add_argument("--log-file", default="logs/agent_runs.jsonl")
     parser.add_argument("--memory-file", default="logs/memory_store.json")
-    parser.add_argument("--reset-memory", action="store_true", help="Reset memory for this session before running.")
-    parser.add_argument("--simulate-turns", type=int, default=0, help="Run back-and-forth girl/man simulation.")
+    parser.add_argument(
+        "--reset-memory", action="store_true", help="Reset memory for this session before running."
+    )
+    parser.add_argument(
+        "--simulate-turns", type=int, default=0, help="Run back-and-forth girl/man simulation."
+    )
     parser.add_argument("--simulation-log-file", default="logs/simulations.jsonl")
     parser.add_argument("--disable-weave", action="store_true")
     parser.add_argument("--show-trace", action="store_true")
@@ -1863,7 +1937,9 @@ def main() -> None:
     run_simulation_fn = _wrap_weave_op(run_simulation) if weave_enabled else run_simulation
 
     if args.simulate_turns > 0:
-        text = (args.text or "Hi... I am curious about you. What makes you feel most alive?").strip()
+        text = (
+            args.text or "Hi... I am curious about you. What makes you feel most alive?"
+        ).strip()
     else:
         text = _read_input_text(args.text)
 

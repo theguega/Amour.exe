@@ -1,4 +1,3 @@
-import { gql, useQuery } from '@apollo/client';
 import {
     Chart as ChartJS,
     Filler,
@@ -8,7 +7,7 @@ import {
     RadialLinearScale,
     Tooltip,
 } from 'chart.js';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Radar } from 'react-chartjs-2';
 import './index.css';
 
@@ -21,102 +20,196 @@ ChartJS.register(
   Legend
 );
 
-// Placeholder GraphQL query for W&B Weave API
-const GET_AMOUR_METRICS = gql`
-  query GetAmourMetrics {
-    run(name: "amour-run") {
-      history {
-        handoffs {
-          girl
-          guy
-        }
-        duration
-        wordCount {
-          girl
-          guy
-        }
-        emotions {
-          girl { joy curiosity nervousness }
-          guy { joy curiosity nervousness }
-        }
-        stage
-      }
-    }
-  }
-`;
-
 const STAGES = ['Strangers', 'Curious', 'Flirting', 'Couple'];
 
 function App() {
-  // Try to use GraphQL for real data (W&B Weave)
-  // this is wrapped in try-catch/error-state in reality,
-  // we poll every 2s for real-time updates.
-  const { data, loading, error } = useQuery(GET_AMOUR_METRICS, {
-    pollInterval: 2000,
-    // Provide a mocked response on error so it renders the dummy data in the dashboard if the endpoint is completely stubbed
-    errorPolicy: 'ignore'
-  });
+  const sessionStartTime = useRef(new Date().getTime());
 
-  // Mock data state for demonstration if GraphQL doesn't work/is placeholder
   const [metrics, setMetrics] = useState({
-    handoffs: { girl: 12, guy: 15 },
-    duration: 120, // seconds
-    wordCount: { girl: 450, guy: 380 },
+    handoffs: { girl: 0, guy: 0 },
+    duration: 0,
+    wordCount: { girl: 0, guy: 0 },
     emotions: {
-      girl: { joy: 0.6, curiosity: 0.8, nervousness: 0.4 },
-      guy: { joy: 0.5, curiosity: 0.7, nervousness: 0.6 },
+      girl: { joy: 0, curiosity: 0, nervousness: 0 },
+      guy: { joy: 0, curiosity: 0, nervousness: 0 },
     },
-    stage: 'Curious'
+    stage: 'Strangers',
+    compatibility: 0,
+    momentum: 0,
+    toolUsage: {
+      memory: 0,
+      seduction: 0,
+      web_search: 0
+    },
+    agentHandoffs: {}
   });
 
-  // Simulate real-time updates if using mock data
+  const [loading, setLoading] = useState(true);
+
   useEffect(() => {
-    if (!data?.run) {
-      const interval = setInterval(() => {
-        setMetrics(prev => {
-          // Add some jitter to emotions
-          const jitter = () => (Math.random() - 0.5) * 0.1;
-          const clamp = (v) => Math.max(0, Math.min(1, v));
+    const fetchWeaveData = async () => {
+      try {
+        const entity = import.meta.env.VITE_WANDB_ENTITY;
+        const project = import.meta.env.VITE_WANDB_PROJECT;
+        const apiKey = import.meta.env.VITE_WANDB_API_KEY;
 
-          let newGirlJoy = clamp(prev.emotions.girl.joy + jitter());
-          let newGuyJoy = clamp(prev.emotions.guy.joy + jitter());
+        if (!entity || !project || !apiKey) {
+          console.error('Missing W&B configuration in .env');
+          return;
+        }
 
-          let duration = prev.duration + 2;
+        const response = await fetch('/weave-api/calls/stream_query', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Basic ${btoa(`api:${apiKey}`)}`,
+          },
+          body: JSON.stringify({
+            project_id: `${entity}/${project}`,
+            filter: {
+              trace_roots_only: true
+            },
+            limit: 100, // Increased limit to ensure we catch all new traces from both computers
+            sort_by: [
+              { field: 'started_at', direction: 'desc' }
+            ]
+          }),
+        });
 
-          // Basic logic to progress stage mock
-          let newStage = prev.stage;
-          const stageIndex = STAGES.indexOf(prev.stage);
-          if (duration > 300 && newGirlJoy > 0.8 && newGuyJoy > 0.8 && stageIndex < 3) {
-             newStage = STAGES[stageIndex+1];
+        if (!response.ok) {
+          throw new Error(`Failed to fetch traces: ${response.statusText}`);
+        }
+
+        const text = await response.text();
+        const lines = text.trim().split('\n');
+        const traces = lines
+          .map(line => {
+            try {
+              return JSON.parse(line);
+            } catch (e) {
+              return null;
+            }
+          })
+          .filter(t => t !== null);
+
+        const logTraces = traces.filter(t => {
+          const isLog = t.op_name && t.op_name.includes('log_to_weave');
+          const startedAt = new Date(t.started_at).getTime();
+          return isLog && startedAt >= sessionStartTime.current;
+        });
+
+        if (logTraces.length === 0) {
+          setLoading(false);
+          return;
+        }
+
+        // Aggregate uniquely using trace IDs to prevent double counting 
+        // across polls or multiple logging computers.
+        const aggregated = logTraces.reduce((acc, trace) => {
+          if (acc.seenTraceIds.has(trace.id)) return acc;
+          acc.seenTraceIds.add(trace.id);
+
+          const input = trace.inputs?.result || {};
+          const output = trace.output || {};
+          const agentType = input.agent_type;
+
+          const words = output.general_stats?.words_spoken_ai || 0;
+          const duration = output.general_stats?.duration || 0;
+
+          acc.totalDuration += duration;
+
+          if (input.tool_calls && Array.isArray(input.tool_calls)) {
+            input.tool_calls.forEach(tc => {
+              if (tc.called && acc.toolUsage[tc.tool] !== undefined) {
+                acc.toolUsage[tc.tool] += 1;
+              }
+            });
           }
 
-          return {
-            ...prev,
-            duration: duration,
-            emotions: {
-              girl: {
-                joy: newGirlJoy,
-                curiosity: clamp(prev.emotions.girl.curiosity + jitter()),
-                nervousness: clamp(prev.emotions.girl.nervousness + jitter()),
-              },
-              guy: {
-                joy: newGuyJoy,
-                curiosity: clamp(prev.emotions.guy.curiosity + jitter()),
-                nervousness: clamp(prev.emotions.guy.nervousness + jitter()),
-              }
-            },
-            stage: newStage
-          };
+          if (output.agent_handoffs?.frequency) {
+            Object.entries(output.agent_handoffs.frequency).forEach(([agent, count]) => {
+              acc.agentHandoffs[agent] = (acc.agentHandoffs[agent] || 0) + count;
+            });
+          }
+
+          if (agentType === 'girl') {
+            acc.handoffs.girl += 1;
+            acc.wordCount.girl += words;
+            if (!acc.emotionsSet.girl) {
+              acc.emotions.girl = {
+                joy: output.emotion_metrics?.spider_web?.joy || 0,
+                curiosity: output.emotion_metrics?.spider_web?.curiosity || 0,
+                nervousness: output.emotion_metrics?.spider_web?.nervousness || 0,
+              };
+              acc.emotionsSet.girl = true;
+            }
+          } else if (agentType === 'man' || agentType === 'guy') {
+            acc.handoffs.guy += 1;
+            acc.wordCount.guy += words;
+            if (!acc.emotionsSet.guy) {
+              acc.emotions.guy = {
+                joy: output.emotion_metrics?.spider_web?.joy || 0,
+                curiosity: output.emotion_metrics?.spider_web?.curiosity || 0,
+                nervousness: output.emotion_metrics?.spider_web?.nervousness || 0,
+              };
+              acc.emotionsSet.guy = true;
+            }
+          }
+
+          if (!acc.relationshipSet && input.relationship) {
+            const rawStage = input.relationship.stage || 'strangers';
+            acc.stage = rawStage.charAt(0).toUpperCase() + rawStage.slice(1);
+            acc.compatibility = input.relationship.compatibility_score || 0;
+            acc.momentum = input.relationship.momentum || 0;
+            acc.relationshipSet = true;
+          }
+
+          return acc;
+        }, {
+          handoffs: { girl: 0, guy: 0 },
+          duration: 0,
+          totalDuration: 0,
+          wordCount: { girl: 0, guy: 0 },
+          emotions: {
+            girl: { joy: 0, curiosity: 0, nervousness: 0 },
+            guy: { joy: 0, curiosity: 0, nervousness: 0 },
+          },
+          stage: 'Strangers',
+          compatibility: 0,
+          momentum: 0,
+          toolUsage: { memory: 0, seduction: 0, web_search: 0 },
+          agentHandoffs: {},
+          emotionsSet: { girl: false, guy: false },
+          relationshipSet: false,
+          seenTraceIds: new Set()
         });
-      }, 2000);
-      return () => clearInterval(interval);
-    }
-  }, [data]);
 
-  // Use actual data if available from GraphQL
-  const currentMetrics = data?.run?.history ? data.run.history[data.run.history.length - 1] : metrics;
+        setMetrics({
+          handoffs: aggregated.handoffs,
+          duration: aggregated.totalDuration,
+          wordCount: aggregated.wordCount,
+          emotions: aggregated.emotions,
+          stage: aggregated.stage,
+          compatibility: aggregated.compatibility,
+          momentum: aggregated.momentum,
+          toolUsage: aggregated.toolUsage,
+          agentHandoffs: aggregated.agentHandoffs
+        });
+        setLoading(false);
 
-  // Radar Chart Data formatting
+      } catch (err) {
+        console.error('Error fetching Weave data:', err);
+        setLoading(false);
+      }
+    };
+
+    fetchWeaveData();
+    const interval = setInterval(fetchWeaveData, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const currentMetrics = metrics;
+
   const radarData = {
     labels: ['Joy', 'Curiosity', 'Nervousness'],
     datasets: [
@@ -163,7 +256,7 @@ function App() {
           color: '#1a1a1a'
         },
         ticks: {
-          display: false, // hide numbers
+          display: false,
           min: 0,
           max: 1,
           stepSize: 0.2
@@ -187,12 +280,29 @@ function App() {
 
   return (
     <div className="dashboard-container">
-      <h1 className="pixel-header">AI Love Story</h1>
+      <img src="/cat.gif" alt="Cat companion left" className="cat-gif cat-left" />
+      <img src="/cat.gif" alt="Cat companion right" className="cat-gif cat-right" />
+      <h1 className="pixel-header">
+        <img src="/heart.png" alt="Love icon" className="heart-icon" />
+        Amour.exe
+      </h1>
 
       <div className="dashboard-grid">
         {/* Stats Panel */}
         <div className="pixel-box stats-panel">
           <h2>[ Stats ]</h2>
+          <div className="stat-item">
+             <span className="stat-label">Compatibility Score:</span>
+             <span className="stat-value">{(currentMetrics.compatibility * 100).toFixed(1)}%</span>
+          </div>
+          <div className="stat-item">
+             <span className="stat-label">Emotional Momentum:</span>
+             <span className="stat-value">{(currentMetrics.momentum >= 0 ? '+' : '')}{currentMetrics.momentum.toFixed(2)}</span>
+          </div>
+          <div className="stat-item">
+             <span className="stat-label">Total Duration:</span>
+             <span className="stat-value">{formatDuration(currentMetrics.duration)}</span>
+          </div>
           <div className="stat-item">
              <span className="stat-label">Handoffs (Girl AI):</span>
              <span className="stat-value">{currentMetrics.handoffs.girl}</span>
@@ -202,16 +312,42 @@ function App() {
              <span className="stat-value">{currentMetrics.handoffs.guy}</span>
           </div>
           <div className="stat-item">
-             <span className="stat-label">Total Duration:</span>
-             <span className="stat-value">{formatDuration(currentMetrics.duration)}</span>
-          </div>
-          <div className="stat-item">
              <span className="stat-label">Word Count (Girl AI):</span>
              <span className="stat-value">{currentMetrics.wordCount.girl}</span>
           </div>
           <div className="stat-item">
              <span className="stat-label">Word Count (Guy AI):</span>
              <span className="stat-value">{currentMetrics.wordCount.guy}</span>
+          </div>
+        </div>
+
+        {/* Help Agents Panel */}
+        <div className="pixel-box stats-panel">
+          <h2>[ Agent Help ]</h2>
+          <div className="stat-item">
+             <span className="stat-label">Memory Access:</span>
+             <span className="stat-value">{currentMetrics.toolUsage.memory}</span>
+          </div>
+          <div className="stat-item">
+             <span className="stat-label">Seduction Coaching:</span>
+             <span className="stat-value">{currentMetrics.toolUsage.seduction}</span>
+          </div>
+          <div className="stat-item">
+             <span className="stat-label">Web Search Usage:</span>
+             <span className="stat-value">{currentMetrics.toolUsage.web_search}</span>
+          </div>
+          <div style={{ marginTop: '10px', borderTop: '1px dashed #ccc', paddingTop: '10px' }}>
+            <span className="stat-label" style={{ fontWeight: 'bold' }}>Agent Handoffs:</span>
+            {Object.entries(currentMetrics.agentHandoffs).length === 0 ? (
+              <div className="stat-item"><span className="stat-label">None</span></div>
+            ) : (
+              Object.entries(currentMetrics.agentHandoffs).map(([agent, count]) => (
+                <div key={agent} className="stat-item">
+                  <span className="stat-label">{agent}:</span>
+                  <span className="stat-value">{count}</span>
+                </div>
+              ))
+            )}
           </div>
         </div>
 

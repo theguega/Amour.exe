@@ -165,11 +165,18 @@ def log_to_weave(result: dict, duration: float) -> dict:
             "dominant_emotion": dominant_emotion,
             "spider_web": spider_chart,
         },
+        "relationship_metrics": {
+            "compatibility_score": result.get("relationship", {}).get("compatibility_score", 0),
+            "momentum": result.get("relationship", {}).get("momentum", 0),
+            "stage": result.get("relationship", {}).get("stage", "strangers"),
+            "turns": result.get("relationship", {}).get("turns", 0),
+        },
         "general_stats": {
             "duration": duration,
             "words_spoken_ai": len(str(result.get("response", "")).split()),
             "words_spoken_user": len(str(result.get("input_text", "")).split()),
         },
+        "usage": result.get("usage", {}),
     }
 
 
