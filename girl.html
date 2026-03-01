@@ -253,16 +253,22 @@
                         setCharacterState("idle");
                         hideTypingBubble();
                     } else if (data.action === "speech") {
-                        setCharacterState("talking");
-                        showSpeech(data.text);
-
-                        // Switch back to idle after some time (rough estimate based on text length)
-                        const duration = Math.max(2000, data.text.length * 50);
+                        // Simulate reading + thinking delay before responding
+                        setCharacterState("thinking");
+                        showTypingBubble();
+                        const thinkDelay = Math.max(1500, Math.min(4000, data.text.length * 30));
                         setTimeout(() => {
-                            if (character.classList.contains("talking")) {
-                                setCharacterState("idle");
-                            }
-                        }, duration);
+                            setCharacterState("talking");
+                            showSpeech(data.text);
+
+                            // Switch back to idle after speech duration
+                            const duration = Math.max(2000, data.text.length * 50);
+                            setTimeout(() => {
+                                if (character.classList.contains("talking")) {
+                                    setCharacterState("idle");
+                                }
+                            }, duration);
+                        }, thinkDelay);
                     } else if (data.action === "sentiment") {
                         updateSentiment(data.compatibility, data.stage);
                     }
