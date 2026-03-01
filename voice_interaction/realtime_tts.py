@@ -4,8 +4,10 @@ import os
 import struct
 from typing import AsyncIterator
 
+import certifi
 from dotenv import load_dotenv
 from mistralai import Mistral
+from mistralai.extra.exceptions import RealtimeTranscriptionException
 from mistralai.extra.realtime import UnknownRealtimeEvent
 from mistralai.models import (
     AudioFormat,
@@ -17,6 +19,9 @@ from mistralai.models import (
 
 load_dotenv()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+# Force a known CA bundle for TLS validation (helps on macOS Python cert-chain issues).
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 client = Mistral(api_key=MISTRAL_API_KEY)
 audio_format = AudioFormat(encoding="pcm_s16le", sample_rate=16000)
 
@@ -126,6 +131,14 @@ async def listen_and_transcribe(
             elif isinstance(event, UnknownRealtimeEvent):
                 print(f"Unknown event: {event}")
                 continue
+    except RealtimeTranscriptionException as e:
+        print(f"Realtime transcription connection failed: {e}")
+        print(
+            "TLS cert check failed. On macOS, run: "
+            "'/Applications/Python\\ 3.12/Install\\ Certificates.command' "
+            "then retry with uv."
+        )
+        return ""
     except KeyboardInterrupt:
         print("Stopping...")
     return "".join(transcribed_text)
