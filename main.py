@@ -185,6 +185,7 @@ def log_to_weave(result: dict, duration: float) -> dict:
     }
 
     return {
+        "agent_type": result.get("agent_type", "unknown"),
         "agent_handoffs": {"handoffs": handoffs, "frequency": freq},
         "emotion_metrics": {
             "sentiment_score": sentiment,
@@ -284,9 +285,11 @@ async def run_voice_loop(args) -> None:
         rel = result.get("relationship", {})
         print(f"[turn {turn_idx}] reply ({len(reply)} chars): {reply[:120]}...")
         await broadcast({"action": "speech", "text": reply})
+        default_compat = 0.0 if args.type == "girl" else 1.0
         await broadcast({
             "action": "sentiment",
-            "compatibility": rel.get("compatibility_score", 0.2),
+            "agent_type": args.type,
+            "compatibility": rel.get("compatibility_score", default_compat),
             "stage": rel.get("stage", "strangers"),
             "trend": rel.get("trend", "stable"),
         })
@@ -384,9 +387,11 @@ async def run_duplex_loop(args) -> None:
         _print_turn(current_agent, result)
 
         rel = result.get("relationship", {})
+        default_compat = 0.0 if current_agent == "girl" else 1.0
         await broadcast({
             "action": "sentiment",
-            "compatibility": rel.get("compatibility_score", 0.2),
+            "agent_type": current_agent,
+            "compatibility": rel.get("compatibility_score", default_compat),
             "stage": rel.get("stage", "strangers"),
             "trend": rel.get("trend", "stable"),
         })

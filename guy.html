@@ -156,16 +156,16 @@
 
             .sentiment-fill {
                 width: 100%;
-                height: 20%;
-                background: linear-gradient(to top, #ff4d6d, #ff758f, #ff8fa3);
+                height: 100%;
+                background: linear-gradient(to top, #888, #c4b200, #2ecc71);
                 border-radius: 0 0 12px 12px;
                 transition: height 1s ease-in-out;
                 position: relative;
             }
 
             .sentiment-fill.high {
-                background: linear-gradient(to top, #e5383b, #ff4d6d, #ff758f);
-                box-shadow: 0 0 12px rgba(255, 77, 109, 0.6);
+                background: linear-gradient(to top, #27ae60, #2ecc71, #58d68d);
+                box-shadow: 0 0 12px rgba(46, 204, 113, 0.6);
             }
 
             .sentiment-icon {
@@ -184,7 +184,7 @@
 
             @keyframes heartPulse {
                 0%, 100% { transform: scale(1); }
-                50% { transform: scale(1.4); }
+                50% { transform: scale(1.3); }
             }
 
             .sentiment-label {
@@ -202,8 +202,8 @@
     </head>
     <body>
         <div class="room-container">
-            <div class="sentiment-label">Love</div>
-            <div class="sentiment-icon" id="sentimentIcon">&#x2764;&#xFE0F;</div>
+            <div class="sentiment-label">Confidence</div>
+            <div class="sentiment-icon" id="sentimentIcon">&#x26A1;</div>
             <div class="sentiment-bar">
                 <div class="sentiment-fill" id="sentimentFill"></div>
             </div>
@@ -270,6 +270,8 @@
                             }, duration);
                         }, thinkDelay);
                     } else if (data.action === "sentiment") {
+                        const agentType = data.agent_type;
+                        if (agentType !== "man") return;
                         updateSentiment(data.compatibility, data.stage);
                     }
                 };
