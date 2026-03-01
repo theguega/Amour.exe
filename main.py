@@ -72,6 +72,29 @@ async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> N
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+async def _watch_stop_key(stop_event: asyncio.Event, key: str = "b") -> None:
+    """Listen for a key press in raw terminal mode and set stop_event when pressed."""
+    import sys
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    loop = asyncio.get_running_loop()
+    try:
+        tty.setraw(fd)
+        while not stop_event.is_set():
+            ch = await loop.run_in_executor(None, sys.stdin.read, 1)
+            if ch.lower() == key:
+                stop_event.set()
+                break
+            if ch in ("\x03", "\x1b"):
+                stop_event.set()
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def _fallback_prompt(agent_type: str) -> str:
     """Return what the OTHER person says to open the conversation."""
     if agent_type == "girl":
@@ -201,14 +224,25 @@ async def run_voice_loop(args) -> None:
     if args.listen_first and not args.seed_text.strip():
         if not args.auto:
             await wait_for_spacebar("[press SPACE to start your first message]")
-        print("[stt] listen-first enabled: waiting for your input...")
+        print("[stt] listen-first enabled: waiting for your input... (press B to stop)")
         from voice_interaction.realtime_tts import listen_and_transcribe
 
-        heard = await listen_and_transcribe(
-            silence_timeout_s=stt_silence,
-            noise_calibration_s=args.noise_calibration_s,
-            speech_ratio=args.speech_ratio,
-        )
+        stop_event = asyncio.Event()
+        key_task = asyncio.create_task(_watch_stop_key(stop_event))
+        try:
+            heard = await listen_and_transcribe(
+                silence_timeout_s=stt_silence,
+                noise_calibration_s=args.noise_calibration_s,
+                speech_ratio=args.speech_ratio,
+                stop_event=stop_event,
+            )
+        finally:
+            stop_event.set()
+            key_task.cancel()
+            try:
+                await key_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
         incoming = heard.strip() or _fallback_prompt("man" if args.type == "girl" else "girl")
 
     while args.max_turns <= 0 or turn_idx < args.max_turns:
@@ -275,17 +309,27 @@ async def run_voice_loop(args) -> None:
             print(f"[turn {turn_idx}] waiting for spacebar...")
             await wait_for_spacebar()
 
-        print(f"[turn {turn_idx}] starting STT...")
+        print(f"[turn {turn_idx}] starting STT... (press B to stop listening)")
         t_stt = time.perf_counter()
+        stop_event = asyncio.Event()
+        key_task = asyncio.create_task(_watch_stop_key(stop_event))
         try:
             transcribed_text = await listen_and_transcribe(
                 silence_timeout_s=stt_silence,
                 noise_calibration_s=args.noise_calibration_s,
                 speech_ratio=args.speech_ratio,
+                stop_event=stop_event,
             )
         except Exception as exc:
             print(f"[turn {turn_idx}] STT CRASHED: {type(exc).__name__}: {exc}")
             raise
+        finally:
+            stop_event.set()
+            key_task.cancel()
+            try:
+                await key_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
         print(f"[turn {turn_idx}] STT done in {time.perf_counter() - t_stt:.2f}s")
         incoming = transcribed_text.strip()
         if not incoming:
