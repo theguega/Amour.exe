@@ -11,6 +11,7 @@ dependencies = [
     "pyaudio>=0.2.14",
     "pygame>=2.6.1",
     "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
     "weave>=0.52.29",
     "websockets>=16.0",
 ]
