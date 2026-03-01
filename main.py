@@ -10,7 +10,7 @@ VOICE_IDS = {"girl": "dn2rTVHQ2BeQJfsX1Pr7", "man": "QtJDM0PJ8GaUfT83yDRe"}
 def _append_jsonl(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
 
 
 async def play_audio(audio_path: Path) -> None:
@@ -24,6 +24,25 @@ async def play_audio(audio_path: Path) -> None:
     pygame.mixer.quit()
 
 
+async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> None:
+    import sys, tty, termios
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    print(prompt, flush=True)
+    loop = asyncio.get_running_loop()
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = await loop.run_in_executor(None, sys.stdin.read, 1)
+            if ch == " ":
+                break
+            if ch in ("\x03", "\x1b"):
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def _fallback_prompt(agent_type: str) -> str:
     if agent_type == "girl":
         return "Hey... I am here with you. Tell me one thing about your day."
@@ -34,13 +53,28 @@ def _print_turn(prefix: str, result: dict) -> None:
     reply = result["response"]
     tool_calls = [c["tool"] for c in result.get("tool_calls", []) if c.get("called")]
     rel = result.get("relationship", {})
+    native_timing = result.get("native_timing_ms", {})
+    trace = result.get("reasoning_traces", {})
+    native_events = trace.get("native_handoff_events", []) if isinstance(trace, dict) else []
+    timing_parts = []
+    if isinstance(native_timing, dict) and native_timing:
+        for key in ["prep", "handoff", "parse", "total"]:
+            if key in native_timing:
+                timing_parts.append(f"{key}_ms={native_timing[key]}")
+    timing_txt = f" timing=({' '.join(timing_parts)})" if timing_parts else ""
+    event_txt = ""
+    if isinstance(native_events, list) and native_events:
+        types = [e.get("type") for e in native_events if isinstance(e, dict) and isinstance(e.get("type"), str)]
+        if types:
+            short_types = ",".join(types[:6]) + ("..." if len(types) > 6 else "")
+            event_txt = f" native_events={len(native_events)}[{short_types}]"
     print(f"[{prefix}] {reply}")
     print(
         "[metrics] "
         f"tools={','.join(tool_calls) if tool_calls else 'none'} "
         f"stage={rel.get('stage', 'n/a')} "
         f"trend={rel.get('trend', 'n/a')} "
-        f"score={rel.get('compatibility_score', 'n/a')}"
+        f"score={rel.get('compatibility_score', 'n/a')}{timing_txt}{event_txt}"
     )
 
 
@@ -64,6 +98,7 @@ async def run_voice_loop(args) -> None:
     turn_idx = 0
 
     if args.listen_first and not args.seed_text.strip():
+        await wait_for_spacebar("[press SPACE to start your first message]")
         print("[stt] listen-first enabled: waiting for your input...")
         from voice_interaction.realtime_tts import listen_and_transcribe
 
@@ -96,6 +131,7 @@ async def run_voice_loop(args) -> None:
         print(f"[tts] file={audio_path}")
         await play_audio(audio_path)
 
+        await wait_for_spacebar()
         print("[stt] listening for the other agent/user...")
         transcribed_text = await listen_and_transcribe(
             silence_timeout_s=args.silence_timeout_s,
@@ -127,6 +163,7 @@ async def run_duplex_loop(args) -> None:
     )
     for turn_idx in range(1, turns + 1):
         print(f"\n[turn {turn_idx}] {current_agent} hears -> {incoming}")
+        t0 = time.perf_counter()
         result = run_turn(
             caller=caller,
             memory_store=memory_store,
@@ -135,7 +172,9 @@ async def run_duplex_loop(args) -> None:
             session_id=args.session_id,
             mood_profile=_mood_for(current_agent, args),
         )
+        turn_ms = round((time.perf_counter() - t0) * 1000, 1)
         _append_jsonl(Path(args.log_file), result)
+        print(f"[duplex] turn={turn_idx} agent={current_agent} elapsed_ms={turn_ms}")
         _print_turn(current_agent, result)
 
         incoming = result["response"]
