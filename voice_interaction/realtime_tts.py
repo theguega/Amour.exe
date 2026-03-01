@@ -69,6 +69,7 @@ async def iter_microphone(
     print("Listening...")
 
     silence_since: float | None = None
+    speech_started = False
 
     try:
         while True:
@@ -78,14 +79,17 @@ async def iter_microphone(
             energy = rms(data)
             now = loop.time()
 
-            if energy < silence_threshold:
+            if energy >= silence_threshold:
+                if not speech_started:
+                    speech_started = True
+                    print("[Speech detected]")
+                silence_since = None
+            elif speech_started:
                 if silence_since is None:
                     silence_since = now
                 elif now - silence_since >= silence_timeout_s:
                     print(f"\n[Silence detected for {silence_timeout_s}s, stopping.]")
                     break
-            else:
-                silence_since = None
 
     finally:
         stream.stop_stream()
