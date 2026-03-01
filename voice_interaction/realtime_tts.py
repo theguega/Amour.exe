@@ -42,6 +42,7 @@ async def iter_microphone(
     silence_timeout_s: float = 3.0,
     noise_calibration_s: float = 1.0,
     speech_ratio: float = 2.5,
+    stop_event: asyncio.Event | None = None,
 ) -> AsyncIterator[bytes]:
     import pyaudio
 
@@ -66,26 +67,34 @@ async def iter_microphone(
     noise_floor = sum(noise_samples) / len(noise_samples)
     silence_threshold = noise_floor * speech_ratio
     print(f"[Noise floor: {noise_floor:.1f}, silence threshold set to: {silence_threshold:.1f}]")
-    print("Listening...")
+    print("Listening... (press B to stop)")
 
     silence_since: float | None = None
+    speech_started = False
 
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                print("\n[Stop key pressed, stopping mic.]")
+                break
+
             data = await loop.run_in_executor(None, stream.read, chunk_samples, False)
             yield data
 
             energy = rms(data)
             now = loop.time()
 
-            if energy < silence_threshold:
+            if energy >= silence_threshold:
+                if not speech_started:
+                    speech_started = True
+                    print("[Speech detected]")
+                silence_since = None
+            elif speech_started:
                 if silence_since is None:
                     silence_since = now
                 elif now - silence_since >= silence_timeout_s:
                     print(f"\n[Silence detected for {silence_timeout_s}s, stopping.]")
                     break
-            else:
-                silence_since = None
 
     finally:
         stream.stop_stream()
@@ -101,6 +110,7 @@ async def listen_and_transcribe(
     silence_timeout_s: float = 3.0,
     noise_calibration_s: float = 1.0,
     speech_ratio: float = 2.5,
+    stop_event: asyncio.Event | None = None,
 ) -> str:
     audio_stream = iter_microphone(
         sample_rate=audio_format.sample_rate,
@@ -108,6 +118,7 @@ async def listen_and_transcribe(
         silence_timeout_s=silence_timeout_s,
         noise_calibration_s=noise_calibration_s,
         speech_ratio=speech_ratio,
+        stop_event=stop_event,
     )
     transcribed_text = []
     try:
