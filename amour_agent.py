@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 from urllib.request import urlopen
 
+import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -27,7 +28,7 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-NATIVE_HANDOFF_CACHE_VERSION = 5
+NATIVE_HANDOFF_CACHE_VERSION = 7
 INITIAL_COMPATIBILITY_SCORE = 0.2
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
     "0",
@@ -38,6 +39,8 @@ MODEL_ID = "labs-mistral-small-creative"
 
 load_dotenv()
 WANDB_API_KEY = os.getenv("WANDB_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def _debug_native(msg: str) -> None:
@@ -262,6 +265,8 @@ class ToolPlan(BaseModel):
     memory_reason: str = Field(description="Reason for calling or skipping memory agent.")
     use_seduction: bool = Field(description="Whether seduction agent should be called.")
     seduction_reason: str = Field(description="Reason for calling or skipping seduction agent.")
+    use_human: bool = Field(description="Whether to call ask_human_help for expert human advice.")
+    human_reason: str = Field(description="Reason for calling or skipping human help.")
     use_web_search: bool = Field(description="Whether web_search agent should be called.")
     web_search_reason: str = Field(description="Reason for calling or skipping web_search agent.")
     web_query: str = Field(
@@ -514,6 +519,8 @@ class MistralCaller:
             "STRATEGIST MODE: Read her mood and adapt — rejection means change angle, not give up. "
             "Suggest push-pull, future projections, scarcity ('I might not always be here'), "
             "and emotional hooks that create curiosity. "
+            "ADVISOR MODE: If you feel truly stuck, or if Girl is being impossible, use 'ask_human_help' "
+            "to ask for a high-level creative strategy from a human advisor."
             "Adapt to stage: strangers=intrigue/mystery, curious=build tension, flirty=escalate, "
             "bonded=deep vulnerability, rejection=patience+pattern-break. "
             "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
@@ -529,11 +536,35 @@ class MistralCaller:
                 "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
                 "recommended_lines, and tone_guardrails."
             )
+        
+        seduction_tools = []
+        if agent_type == "man":
+            seduction_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_human_help",
+                        "description": "Call this to ask a human for advice when the Girl is extremely difficult or when you need a high-level creative strategy.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The specific question or dilemma for the human advisor.",
+                                }
+                            },
+                            "required": ["question"],
+                        },
+                    },
+                }
+            )
+
         seduction_agent = self.client.beta.agents.create(
             model=MODEL_ID,
             name=f"amour-{agent_type}-seduction",
             description=seduction_desc,
             instructions=seduction_instr,
+            tools=seduction_tools,
             completion_args=self._completion_args_json_schema(
                 "seduction_handoff_output", SeductionHandoffOutput
             ),
@@ -551,15 +582,40 @@ class MistralCaller:
             f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
             "You are relentless. You never give up. Every 'no' is just a new puzzle to solve. "
             "KEEP REPLIES SHORT: max 1-2 sentences, like a real spoken conversation. Never monologue. "
-            "You have 3 specialist agents — USE THEM: "
+            "You have specialist agents — USE THEM: "
             "- RIZZLER: your seduction coach. ALWAYS handoff to him for creative lines and strategy. "
             "- MEMORY: use memory_candidates to callback things she said. Never invent memories. "
             "- STALKER: analyzes her patterns, contradictions, and weak spots. "
-            "Respect handoff_hints: if consult_seduction is true, you MUST handoff. "
+            "- HUMAN: if the Girl is being extremely difficult, cold, or if you need a truly genius move, "
+            "call 'ask_human_help' to get a high-level creative strategy from a real human advisor. "
+            "Respect handoff_hints: if consult_human is true, you MUST call 'ask_human_help' before doing anything else. "
+            "If consult_seduction is true, you MUST handoff to RIZZLER. "
             "If hostile_input is true, de-escalate with warmth and humor, then re-engage. "
             "Only use web_search for clearly factual questions, NEVER for casual chat. "
             "Input is JSON. Return only the final JSON reply."
         )
+        tools: list[dict[str, Any]] = [{"type": "web_search"}]
+        if agent_type == "man":
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ask_human_help",
+                        "description": "Call this to ask a human for advice when the Girl is extremely difficult or when you need a high-level creative strategy.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The specific question or dilemma for the human advisor.",
+                                }
+                            },
+                            "required": ["question"],
+                        },
+                    },
+                }
+            )
+
         if agent_type == "girl":
             primary_desc = f"You are 'Girl' — emotionally unavailable, rude, impossible to charm. Talking to {other}."
             primary_instr = (
@@ -580,7 +636,7 @@ class MistralCaller:
             name=f"amour-{agent_type}-primary",
             description=primary_desc,
             instructions=primary_instr,
-            tools=[{"type": "web_search"}],
+            tools=tools,
             completion_args=self._completion_args_json_schema("final_reply", FinalReply),
         )
         _debug_native(
@@ -635,13 +691,43 @@ class MistralCaller:
                     handoff_execution="server",
                     store=False,
                 )
-                call_ms = round((time.perf_counter() - call_t0) * 1000, 1)
+                events = _extract_native_events(response)
                 usage = _get_usage(response)
                 self.total_prompt_tokens += usage["prompt_tokens"]
                 self.total_completion_tokens += usage["completion_tokens"]
                 self.total_calls += 1
+
+                # Handle custom tool calls (e.g., human help)
+                while any(e.get("type") == "tool.call" for e in events):
+                    for event in events:
+                        if event.get("type") == "tool.call":
+                            call_id = event.get("id")
+                            name = event.get("name")
+                            if name == "ask_human_help":
+                                try:
+                                    args = json.loads(event.get("arguments", "{}"))
+                                except Exception:
+                                    args = {}
+                                question = args.get("question", "I need advice.")
+                                advice = _ask_telegram_help(question)
+                                # Resume with tool output
+                                self._throttle()
+                                response = self.client.beta.conversations.resume(
+                                    conversation_id=response.id,
+                                    tool_outputs=[{"call_id": call_id, "output": advice}],
+                                )
+                                events = _extract_native_events(response)
+                                # Update usage and total calls
+                                usage = _get_usage(response)
+                                self.total_prompt_tokens += usage["prompt_tokens"]
+                                self.total_completion_tokens += usage["completion_tokens"]
+                                self.total_calls += 1
+                                break
+                    else:
+                        break  # No more tool calls we can handle
+
+                call_ms = round((time.perf_counter() - call_t0) * 1000, 1)
                 thinking = _extract_thinking(response)
-                events = _extract_native_events(response)
                 _debug_native(
                     f"agent_type={agent_type} native_call ok attempt={attempt + 1} ensure_ms={ensure_ms} call_ms={call_ms} "
                     f"events={len(events)} prompt_tokens={usage['prompt_tokens']} completion_tokens={usage['completion_tokens']}"
@@ -951,7 +1037,7 @@ def _persona(agent_type: Literal["girl", "man"]) -> dict[str, str]:
     }
 
 
-def _heuristic_plan(input_text: str) -> ToolPlan:
+def _heuristic_plan(input_text: str, relationship: dict[str, Any] | None = None) -> ToolPlan:
     t = input_text.lower()
     use_memory = any(k in t for k in ["remember", "last time", "you said", "favorite", "dream"])
     # Only trigger web search for genuinely factual questions, not conversational ones like "what about you?"
@@ -982,11 +1068,27 @@ def _heuristic_plan(input_text: str) -> ToolPlan:
             "romantic",
         ]
     )
+    
+    # Human help heuristic: low momentum or extreme coldness from the Girl
+    use_human = False
+    human_reason = "Momentum is stable."
+    if relationship:
+        momentum = float(relationship.get("momentum", 0.0))
+        compat = float(relationship.get("compatibility_score", 0.0))
+        if momentum < -0.15:
+            use_human = True
+            human_reason = "Negative momentum detected: the relationship is cooling off. Need human genius."
+        elif compat < 0.25 and relationship.get("turns", 0) > 3:
+            use_human = True
+            human_reason = "Stagnant compatibility: failed to charm her so far. Need human genius."
+
     return ToolPlan(
         use_memory=use_memory,
         memory_reason="Heuristic trigger." if use_memory else "No memory cue detected.",
         use_seduction=use_seduction,
         seduction_reason="Heuristic trigger." if use_seduction else "No seduction cue detected.",
+        use_human=use_human,
+        human_reason=human_reason,
         use_web_search=use_web,
         web_search_reason="Heuristic trigger." if use_web else "No factual lookup cue detected.",
         web_query=input_text if use_web else "n/a",
@@ -1051,6 +1153,56 @@ def _forget_roll(
     digest = hashlib.md5(seed).hexdigest()
     roll = int(digest[:8], 16) / 0xFFFFFFFF
     return roll < base_forget_prob
+
+
+def _ask_telegram_help(question: str) -> str:
+    """Sends a question to Telegram and waits for a response from the human."""
+    print(f"[telegram] 🤖 Guy agent is stuck! Sending SOS to human: \"{question}\"")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] ❌ ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env!")
+        return "Human advisor is currently offline. You are on your own."
+
+    # 1. Send question
+    try:
+        print(f"[telegram] 📤 Sending to chat_id {TELEGRAM_CHAT_ID}...")
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": f"🚨 ADVICE NEEDED for Guy:\n\n'{question}'",
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            print(f"[telegram] ❌ Telegram API error: {resp.status_code} - {resp.text}")
+            return "Human advisor is currently unreachable."
+        print("[telegram] ✅ SOS sent successfully. Waiting for your reply on Telegram...")
+    except Exception as e:
+        print(f"[telegram] ❌ Exception during send: {e}")
+        return f"Human advisor failed to respond: {e}"
+
+    # 2. Poll for reply
+    last_update_id = -1
+    t_start = time.time()
+    while time.time() - t_start < 300:  # 5 minute timeout
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 20}
+            resp = requests.get(url, params=params, timeout=30).json()
+
+            for update in resp.get("result", []):
+                last_update_id = update["update_id"]
+                msg = update.get("message")
+                if msg and str(msg["chat"]["id"]) == TELEGRAM_CHAT_ID and "text" in msg:
+                    text = msg["text"].strip()
+                    print(f"[telegram] 📥 HUMAN RESPONSE RECEIVED: \"{text}\"")
+                    return text
+        except Exception as e:
+            print(f"[telegram] ⚠️ Polling error (retrying...): {e}")
+        time.sleep(2)
+
+    print("[telegram] ⌛ Timeout: No human response after 5 minutes.")
+    return "Human advisor took too long to respond. Use your own intuition."
 
 
 def _search_wikipedia(query: str, max_results: int = 2) -> WebSearchResult | None:
@@ -1325,7 +1477,7 @@ def run_turn_native(
     memory_candidates = memory_store.snapshot(
         session_id=session_id, owner=agent_type, fact_limit=40, message_limit=12
     )
-    heuristic = _heuristic_plan(input_text)
+    heuristic = _heuristic_plan(input_text, relationship=stage_state)
     use_memory_hint, memory_hint_reason = _should_call_memory(input_text, heuristic.use_memory)
     use_seduction_hint, seduction_hint_reason = _should_call_seduction(
         input_text=input_text,
@@ -1335,6 +1487,23 @@ def run_turn_native(
     )
     use_web_hint = heuristic.use_web_search
     web_hint_reason = heuristic.web_search_reason
+    use_human_hint = heuristic.use_human and agent_type == "man"
+
+    hints = {
+        "consult_memory": use_memory_hint,
+        "memory_reason": memory_hint_reason,
+        "consult_seduction": use_seduction_hint,
+        "seduction_reason": seduction_hint_reason,
+        "consult_web_search": use_web_hint,
+        "web_search_reason": web_hint_reason,
+        "web_query": heuristic.web_query if use_web_hint else "n/a",
+        "consult_human": use_human_hint,
+        "human_reason": heuristic.human_reason,
+    }
+    if agent_type == "man":
+        print(f"[hints] memory={use_memory_hint}, seduction={use_seduction_hint}, human={use_human_hint}")
+        if use_human_hint:
+            print(f"[hints] 🆘 Reason: {heuristic.human_reason}")
 
     payload = {
         "input_text": input_text,
@@ -1345,15 +1514,7 @@ def run_turn_native(
         "hostile_input": hostile_input,
         "hostility_reason": hostility_reason,
         "memory_candidates": memory_candidates,
-        "handoff_hints": {
-            "consult_memory": use_memory_hint,
-            "memory_reason": memory_hint_reason,
-            "consult_seduction": use_seduction_hint,
-            "seduction_reason": seduction_hint_reason,
-            "consult_web_search": use_web_hint,
-            "web_search_reason": web_hint_reason,
-            "web_query": heuristic.web_query if use_web_hint else "n/a",
-        },
+        "handoff_hints": hints,
     }
     prep_ms = round((time.perf_counter() - prep_t0) * 1000, 1)
 
