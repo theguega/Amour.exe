@@ -4,7 +4,34 @@ import json
 import time
 from pathlib import Path
 
+import websockets
+
 VOICE_IDS = {"girl": "dn2rTVHQ2BeQJfsX1Pr7", "man": "QtJDM0PJ8GaUfT83yDRe"}
+
+CONNECTED_CLIENTS = set()
+
+
+async def ws_handler(websocket):
+    CONNECTED_CLIENTS.add(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        CONNECTED_CLIENTS.remove(websocket)
+
+
+async def start_ws_server():
+    print("[ws] starting server on ws://localhost:8080")
+    async with websockets.serve(ws_handler, "localhost", 8080):
+        await asyncio.Future()  # run forever
+
+
+async def broadcast(message: dict):
+    if not CONNECTED_CLIENTS:
+        return
+    payload = json.dumps(message)
+    await asyncio.gather(
+        *[client.send(payload) for client in CONNECTED_CLIENTS], return_exceptions=True
+    )
 
 
 def _append_jsonl(path: Path, payload: dict) -> None:
@@ -25,7 +52,9 @@ async def play_audio(audio_path: Path) -> None:
 
 
 async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> None:
-    import sys, tty, termios
+    import sys
+    import termios
+    import tty
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -64,7 +93,11 @@ def _print_turn(prefix: str, result: dict) -> None:
     timing_txt = f" timing=({' '.join(timing_parts)})" if timing_parts else ""
     event_txt = ""
     if isinstance(native_events, list) and native_events:
-        types = [e.get("type") for e in native_events if isinstance(e, dict) and isinstance(e.get("type"), str)]
+        types = [
+            e.get("type")
+            for e in native_events
+            if isinstance(e, dict) and isinstance(e.get("type"), str)
+        ]
         if types:
             short_types = ",".join(types[:6]) + ("..." if len(types) > 6 else "")
             event_txt = f" native_events={len(native_events)}[{short_types}]"
@@ -82,13 +115,75 @@ def _mood_for(agent_type: str, args) -> str:
     return args.girl_mood if agent_type == "girl" else args.man_mood
 
 
+def log_to_weave(result: dict, duration: float) -> dict:
+    import datetime
+
+    from amour_agent import _sentiment_score
+
+    handoffs = []
+    freq = {}
+
+    tool_calls = [c for c in result.get("tool_calls", []) if c.get("called")]
+    for tool in tool_calls:
+        t_name = f"{str(tool.get('tool')).capitalize()} Agent"
+        handoffs.append(
+            {
+                "agent": t_name,
+                "timestamp": result.get(
+                    "ts", datetime.datetime.now(datetime.timezone.utc).isoformat()
+                ),
+            }
+        )
+        freq[t_name] = freq.get(t_name, 0) + 1
+
+    interaction_text = str(result.get("input_text", "")) + " " + str(result.get("response", ""))
+    sentiment = _sentiment_score(interaction_text)
+
+    if sentiment >= 0.5:
+        dominant_emotion = "joy"
+    elif sentiment >= 0.1:
+        dominant_emotion = "curiosity"
+    elif sentiment > -0.1:
+        dominant_emotion = "neutral"
+    elif sentiment > -0.5:
+        dominant_emotion = "nervousness"
+    else:
+        dominant_emotion = "sadness"
+
+    spider_chart = {
+        "joy": max(0.0, sentiment),
+        "nervousness": max(0.0, -sentiment * 0.5),
+        "sadness": max(0.0, -sentiment),
+        "curiosity": 1.0 - abs(sentiment),
+        "anger": 0.0,
+    }
+
+    return {
+        "agent_handoffs": {"handoffs": handoffs, "frequency": freq},
+        "emotion_metrics": {
+            "sentiment_score": sentiment,
+            "dominant_emotion": dominant_emotion,
+            "spider_web": spider_chart,
+        },
+        "general_stats": {
+            "duration": duration,
+            "words_spoken_ai": len(str(result.get("response", "")).split()),
+            "words_spoken_user": len(str(result.get("input_text", "")).split()),
+        },
+    }
+
+
 async def run_voice_loop(args) -> None:
     # Weave init must happen before imports that pull Mistral SDK clients.
-    from amour_agent import MistralCaller, MemoryStore, _init_weave, run_turn
+    from amour_agent import MemoryStore, MistralCaller, _init_weave, _wrap_weave_op, run_turn
     from voice_interaction.offline_stt import text_to_audio
     from voice_interaction.realtime_tts import listen_and_transcribe
 
+    # Start WebSocket server
+    asyncio.create_task(start_ws_server())
+
     _init_weave(enabled=not args.disable_weave)
+    log_to_weave_fn = _wrap_weave_op(log_to_weave) if not args.disable_weave else log_to_weave
     caller = MistralCaller()
     memory_store = MemoryStore(Path(args.memory_file))
     if args.reset_memory:
@@ -113,7 +208,10 @@ async def run_voice_loop(args) -> None:
         turn_idx += 1
         print(f"\n[turn {turn_idx}] input -> {incoming}")
 
-        result = run_turn(
+        await broadcast({"action": "typing"})
+        t_turn = time.perf_counter()
+        result = await asyncio.to_thread(
+            run_turn,
             caller=caller,
             memory_store=memory_store,
             agent_type=args.type,
@@ -121,15 +219,23 @@ async def run_voice_loop(args) -> None:
             session_id=args.session_id,
             mood_profile=_mood_for(args.type, args),
         )
+        await broadcast({"action": "stop_typing"})
+        turn_duration = time.perf_counter() - t_turn
+        log_to_weave_fn(result, turn_duration)
         _append_jsonl(Path(args.log_file), result)
 
         reply = result["response"]
+        await broadcast({"action": "speech", "text": reply})
         _print_turn("agent", result)
 
         print("[tts] generating audio...")
         audio_path = text_to_audio(reply, VOICE_IDS[args.type])
         print(f"[tts] file={audio_path}")
         await play_audio(audio_path)
+
+        # After speaking, wait a bit before hiding bubble, or hide it now?
+        # Maybe hide it after audio finishes?
+        await broadcast({"action": "stop_typing"})  # Ensure it's hidden after speaking
 
         await wait_for_spacebar()
         print("[stt] listening for the other agent/user...")
@@ -145,9 +251,10 @@ async def run_voice_loop(args) -> None:
 
 
 async def run_duplex_loop(args) -> None:
-    from amour_agent import MistralCaller, MemoryStore, _init_weave, run_turn
+    from amour_agent import MemoryStore, MistralCaller, _init_weave, _wrap_weave_op, run_turn
 
     _init_weave(enabled=not args.disable_weave)
+    log_to_weave_fn = _wrap_weave_op(log_to_weave) if not args.disable_weave else log_to_weave
     caller = MistralCaller()
     memory_store = MemoryStore(Path(args.memory_file))
     if args.reset_memory:
@@ -163,6 +270,7 @@ async def run_duplex_loop(args) -> None:
     )
     for turn_idx in range(1, turns + 1):
         print(f"\n[turn {turn_idx}] {current_agent} hears -> {incoming}")
+        t_turn = time.perf_counter()
         t0 = time.perf_counter()
         result = run_turn(
             caller=caller,
@@ -172,6 +280,8 @@ async def run_duplex_loop(args) -> None:
             session_id=args.session_id,
             mood_profile=_mood_for(current_agent, args),
         )
+        turn_duration = time.perf_counter() - t_turn
+        log_to_weave_fn(result, turn_duration)
         turn_ms = round((time.perf_counter() - t0) * 1000, 1)
         _append_jsonl(Path(args.log_file), result)
         print(f"[duplex] turn={turn_idx} agent={current_agent} elapsed_ms={turn_ms}")
@@ -182,9 +292,10 @@ async def run_duplex_loop(args) -> None:
 
 
 async def run_duplex_benchmark(args) -> None:
-    from amour_agent import MistralCaller, MemoryStore, _init_weave, run_turn
+    from amour_agent import MemoryStore, MistralCaller, _init_weave, _wrap_weave_op, run_turn
 
     _init_weave(enabled=not args.disable_weave)
+    log_to_weave_fn = _wrap_weave_op(log_to_weave) if not args.disable_weave else log_to_weave
     turns = args.max_turns if args.max_turns > 0 else 20
     runs = args.benchmark_runs
     if runs <= 0:
@@ -205,6 +316,7 @@ async def run_duplex_benchmark(args) -> None:
 
         t0 = time.perf_counter()
         for turn_idx in range(1, turns + 1):
+            t_turn = time.perf_counter()
             result = run_turn(
                 caller=caller,
                 memory_store=memory_store,
@@ -213,6 +325,8 @@ async def run_duplex_benchmark(args) -> None:
                 session_id=session_id,
                 mood_profile=_mood_for(current_agent, args),
             )
+            turn_duration = time.perf_counter() - t_turn
+            log_to_weave_fn(result, turn_duration)
             _append_jsonl(Path(args.log_file), result)
             incoming = result["response"]
 
@@ -267,10 +381,16 @@ async def run_duplex_benchmark(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Voice runtime loop wired to amour_agent run_turn.")
+    parser = argparse.ArgumentParser(
+        description="Voice runtime loop wired to amour_agent run_turn."
+    )
     parser.add_argument("--type", choices=["girl", "man"], default="girl")
-    parser.add_argument("--duplex", action="store_true", help="Run both girl and man in one local loop.")
-    parser.add_argument("--benchmark-runs", type=int, default=0, help="Run N duplex simulations and report metrics.")
+    parser.add_argument(
+        "--duplex", action="store_true", help="Run both girl and man in one local loop."
+    )
+    parser.add_argument(
+        "--benchmark-runs", type=int, default=0, help="Run N duplex simulations and report metrics."
+    )
     parser.add_argument("--starter", choices=["girl", "man"], default="girl")
     parser.add_argument("--session-id", default="voice-session")
     parser.add_argument("--seed-text", default="")
@@ -282,7 +402,9 @@ def parse_args():
     parser.add_argument("--man-mood", choices=["neutral", "open", "rejection"], default="neutral")
     parser.add_argument("--benchmark-log-file", default="logs/benchmark_runs.jsonl")
     parser.add_argument("--disable-weave", action="store_true")
-    parser.add_argument("--listen-first", action="store_true", help="In voice mode, listen before first response.")
+    parser.add_argument(
+        "--listen-first", action="store_true", help="In voice mode, listen before first response."
+    )
     parser.add_argument("--silence-timeout-s", type=float, default=3.0)
     parser.add_argument("--noise-calibration-s", type=float, default=1.0)
     parser.add_argument("--speech-ratio", type=float, default=2.5)
