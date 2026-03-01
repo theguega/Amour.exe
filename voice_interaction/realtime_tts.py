@@ -126,7 +126,6 @@ async def listen_and_transcribe(
             elif isinstance(event, UnknownRealtimeEvent):
                 print(f"Unknown event: {event}")
                 continue
-        await asyncio.sleep(timeout_seconds)
     except KeyboardInterrupt:
         print("Stopping...")
     return "".join(transcribed_text)
