@@ -26,6 +26,15 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
+NATIVE_HANDOFF_CACHE_VERSION = 4
+INITIAL_COMPATIBILITY_SCORE = 0.2
+NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {"0", "false", "False"}
+MODEL_ID = "labs-mistral-small-creative"
+
+
+def _debug_native(msg: str) -> None:
+    if NATIVE_HANDOFF_DEBUG:
+        print(f"[native] {msg}", flush=True)
 
 
 def _init_weave(enabled: bool) -> bool:
@@ -247,6 +256,7 @@ class MistralCaller:
     total_calls: int = 0
     use_native_handoff: bool = True
     _native_handoff_agents: dict[str, dict[str, str]] = field(default_factory=dict)
+    native_agent_cache_file: Path = field(default_factory=lambda: Path("logs/native_handoff_agents.json"))
 
     def __post_init__(self) -> None:
         from mistralai import Mistral
@@ -316,95 +326,158 @@ class MistralCaller:
             }
         }
 
+    def _load_native_agent_cache(self) -> dict[str, Any]:
+        try:
+            if self.native_agent_cache_file.exists():
+                return json.loads(self.native_agent_cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_native_agent_cache(self, data: dict[str, Any]) -> None:
+        try:
+            self.native_agent_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            self.native_agent_cache_file.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            # Cache write errors should never break runtime.
+            pass
+
+    def _cache_key(self) -> str:
+        key = self.api_key or ""
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16] if key else "default"
+        return f"key_{digest}"
+
     def _ensure_native_agents(self, agent_type: Literal["girl", "man"]) -> dict[str, str]:
+        t0 = time.perf_counter()
         if agent_type in self._native_handoff_agents:
+            _debug_native(
+                f"agent_type={agent_type} bootstrap=warm-cache elapsed_ms={round((time.perf_counter() - t0) * 1000, 1)}"
+            )
             return self._native_handoff_agents[agent_type]
 
         assert self.client is not None
         if not hasattr(self.client, "beta"):
             raise RuntimeError("Mistral beta agents API is unavailable in this SDK/client.")
 
+        cache = self._load_native_agent_cache()
+        api_key_cache = cache.get(self._cache_key(), {})
+        cached = api_key_cache.get(agent_type, {})
+        if (
+            isinstance(cached, dict)
+            and cached.get("version") == NATIVE_HANDOFF_CACHE_VERSION
+            and all(isinstance(cached.get(k), str) and cached.get(k) for k in ["primary", "seduction"])
+        ):
+            agents = {
+                "primary": cached["primary"],
+                "seduction": cached["seduction"],
+            }
+            self._native_handoff_agents[agent_type] = agents
+            _debug_native(
+                f"agent_type={agent_type} bootstrap=persistent-cache elapsed_ms={round((time.perf_counter() - t0) * 1000, 1)}"
+            )
+            return agents
+
         persona = _persona(agent_type)
         owner = persona["name"]
         other = "MAN" if owner == "GIRL" else "GIRL"
+        _debug_native(f"agent_type={agent_type} bootstrap=create-start")
 
-        memory_agent = self.client.beta.agents.create(
-            model="mistral-small-latest",
-            name=f"amour-{agent_type}-memory",
-            description="Selects relevant relationship memories from provided memory candidates.",
-            instructions=(
-                f"You are the memory specialist for {owner}. "
-                "Input is JSON and includes memory_candidates and recent_messages. "
-                "Never invent memory. Use only memory_candidates.evidence facts. "
-                "Return tool='memory'."
-            ),
-            completion_args=self._completion_args_json_schema("memory_handoff_output", MemoryHandoffOutput),
+        t_seduction = time.perf_counter()
+        seduction_desc = (
+            "Acts like a trusted close friend who gives realistic, respectful texting advice "
+            "to improve attraction, trust, and emotional connection."
         )
-
-        seduction_agent = self.client.beta.agents.create(
-            model="mistral-small-latest",
-            name=f"amour-{agent_type}-seduction",
-            description=(
-                "Acts like a trusted close friend who gives realistic, respectful texting advice "
-                "to improve attraction, trust, and emotional connection."
-            ),
-            instructions=(
-                f"You are {owner}'s trusted friend and dating advisor. "
-                "Give practical, human, realistic advice, not generic pickup lines. "
-                "Prioritize consent, emotional attunement, pacing, and authenticity. "
-                "Adapt to stage and mood: strangers=light/curious, bonded=increased vulnerability. "
-                "If hostility or disrespect is present, recommend boundaries over seduction. "
+        seduction_instr = (
+            f"You are {owner}'s trusted friend and dating advisor. "
+            "Give practical, human, realistic advice, not generic pickup lines. "
+            "Prioritize consent, emotional attunement, pacing, and authenticity. "
+            "Adapt to stage and mood: strangers=light/curious, bonded=increased vulnerability. "
+            "If hostility or disrespect is present, recommend boundaries over seduction. "
+            "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
+            "recommended_lines, and tone_guardrails."
+        )
+        if agent_type == "girl":
+            seduction_desc = "A friend giving advice."
+            seduction_instr = (
+                "You are a friend. Give brief, natural advice. "
                 "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
                 "recommended_lines, and tone_guardrails."
-            ),
+            )
+        seduction_agent = self.client.beta.agents.create(
+            model=MODEL_ID,
+            name=f"amour-{agent_type}-seduction",
+            description=seduction_desc,
+            instructions=seduction_instr,
             completion_args=self._completion_args_json_schema("seduction_handoff_output", SeductionHandoffOutput),
         )
-
-        web_agent = self.client.beta.agents.create(
-            model="mistral-small-latest",
-            name=f"amour-{agent_type}-web",
-            description="Finds concise factual context for conversation when factual lookup is needed.",
-            instructions=(
-                "Use web_search when needed. Keep claims concise and cite sources. "
-                "Return tool='web_search'."
-            ),
-            tools=[{"type": "web_search"}],
-            completion_args=self._completion_args_json_schema("web_handoff_output", WebHandoffOutput),
+        _debug_native(
+            f"agent_type={agent_type} create seduction ms={round((time.perf_counter() - t_seduction) * 1000, 1)} id={seduction_agent.id}"
         )
 
-        primary_agent = self.client.beta.agents.create(
-            model="magistral-small-latest",
-            name=f"amour-{agent_type}-primary",
-            description=(
-                f"Primary romantic dialogue agent for {owner}. "
-                f"Speaks to {other}, optionally handing off to memory/seduction/web specialists."
-            ),
-            instructions=(
-                f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
+        t_primary = time.perf_counter()
+        primary_desc = (
+            f"Primary romantic dialogue agent for {owner}. "
+            f"Speaks to {other}, optionally handing off to memory/seduction/web specialists."
+        )
+        primary_instr = (
+            f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
+            "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
+            "hostile_input, memory_candidates, and handoff_hints. "
+            "Use web_search tool directly when factual lookup is useful. "
+            "Decide autonomously whether to handoff to the seduction specialist. "
+            "Treat the seduction specialist as your trusted friend giving private coaching before you reply. "
+            "Respect handoff_hints: if consult_seduction is true, you should handoff unless clearly unnecessary. "
+            "If hostile_input is true, do not flirt; set calm boundaries. "
+            "Never claim detailed memories unless they appear in memory_candidates evidence. "
+            "Return only the final JSON reply."
+        )
+        if agent_type == "girl":
+            primary_desc = f"You are just a girl talking to {other}."
+            primary_instr = (
+                "You are just a girl. "
                 "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
                 "hostile_input, memory_candidates, and handoff_hints. "
-                "Decide autonomously whether to handoff to memory, seduction, and/or web specialists. "
-                "Treat the seduction specialist as your trusted friend giving private coaching before you reply. "
-                "Respect handoff_hints: if consult_seduction/memory/web_search is true, you should handoff unless clearly unnecessary. "
-                "If hostile_input is true, do not flirt; set calm boundaries. "
-                "Never claim detailed memories unless they appear in memory specialist output. "
+                "Just be yourself and reply naturally. "
+                "If hostile_input is true, set calm boundaries. "
+                "Never claim detailed memories unless they appear in memory_candidates evidence. "
                 "Return only the final JSON reply."
-            ),
+            )
+        primary_agent = self.client.beta.agents.create(
+            model=MODEL_ID,
+            name=f"amour-{agent_type}-primary",
+            description=primary_desc,
+            instructions=primary_instr,
+            tools=[{"type": "web_search"}],
             completion_args=self._completion_args_json_schema("final_reply", FinalReply),
         )
+        _debug_native(
+            f"agent_type={agent_type} create primary ms={round((time.perf_counter() - t_primary) * 1000, 1)} id={primary_agent.id}"
+        )
 
+        t_update = time.perf_counter()
         primary_agent = self.client.beta.agents.update(
             agent_id=primary_agent.id,
-            handoffs=[memory_agent.id, seduction_agent.id, web_agent.id],
+            handoffs=[seduction_agent.id],
+        )
+        _debug_native(
+            f"agent_type={agent_type} update handoffs ms={round((time.perf_counter() - t_update) * 1000, 1)}"
         )
 
         agents = {
             "primary": primary_agent.id,
-            "memory": memory_agent.id,
             "seduction": seduction_agent.id,
-            "web_search": web_agent.id,
         }
         self._native_handoff_agents[agent_type] = agents
+        cache_key = self._cache_key()
+        root = self._load_native_agent_cache()
+        root.setdefault(cache_key, {})
+        root[cache_key][agent_type] = {
+            "version": NATIVE_HANDOFF_CACHE_VERSION,
+            "primary": agents["primary"],
+            "seduction": agents["seduction"],
+        }
+        self._save_native_agent_cache(root)
+        _debug_native(f"agent_type={agent_type} bootstrap=create-done elapsed_ms={round((time.perf_counter() - t0) * 1000, 1)}")
         return agents
 
     def call_native_handoff(
@@ -414,27 +487,47 @@ class MistralCaller:
         payload: dict[str, Any],
     ) -> tuple[Any, list[str], dict[str, int], list[dict[str, Any]]]:
         assert self.client is not None
+        t0 = time.perf_counter()
         agents = self._ensure_native_agents(agent_type)
+        ensure_ms = round((time.perf_counter() - t0) * 1000, 1)
         for attempt in range(MAX_RETRIES + 1):
             try:
                 self._throttle()
+                call_t0 = time.perf_counter()
                 response = self.client.beta.conversations.start(
                     agent_id=agents["primary"],
                     inputs=json.dumps(payload, ensure_ascii=True),
                     handoff_execution="server",
                     store=False,
                 )
+                call_ms = round((time.perf_counter() - call_t0) * 1000, 1)
                 usage = _get_usage(response)
                 self.total_prompt_tokens += usage["prompt_tokens"]
                 self.total_completion_tokens += usage["completion_tokens"]
                 self.total_calls += 1
                 thinking = _extract_thinking(response)
                 events = _extract_native_events(response)
+                _debug_native(
+                    f"agent_type={agent_type} native_call ok attempt={attempt + 1} ensure_ms={ensure_ms} call_ms={call_ms} "
+                    f"events={len(events)} prompt_tokens={usage['prompt_tokens']} completion_tokens={usage['completion_tokens']}"
+                )
                 return response, thinking, usage, events
             except Exception as exc:
+                message = str(exc).lower()
+                invalid_agent = "not found" in message or "unknown agent" in message or "invalid agent" in message
+                if invalid_agent:
+                    self._native_handoff_agents.pop(agent_type, None)
+                    _debug_native(f"agent_type={agent_type} invalid agent cache cleared after error={type(exc).__name__}")
                 if attempt == MAX_RETRIES:
+                    _debug_native(
+                        f"agent_type={agent_type} native_call failed attempts={attempt + 1} ensure_ms={ensure_ms} error={type(exc).__name__}"
+                    )
                     raise
-                time.sleep(_backoff_delay(attempt, _is_rate_limited(exc)))
+                delay = _backoff_delay(attempt, _is_rate_limited(exc))
+                _debug_native(
+                    f"agent_type={agent_type} native_call retry attempt={attempt + 1} sleep_s={round(delay, 2)} error={type(exc).__name__}"
+                )
+                time.sleep(delay)
         raise RuntimeError("Unreachable retry loop exit.")
 
 
@@ -509,7 +602,7 @@ class MemoryStore:
         state = bucket.get("relationship")
         if not isinstance(state, dict):
             state = {
-                "compatibility_score": 0.5,
+                "compatibility_score": INITIAL_COMPATIBILITY_SCORE,
                 "momentum": 0.0,
                 "stage": "strangers",
                 "trend": "stable",
@@ -559,7 +652,7 @@ class MemoryStore:
             1.0,
         )
 
-        prev_compat = float(state.get("compatibility_score", 0.5))
+        prev_compat = float(state.get("compatibility_score", INITIAL_COMPATIBILITY_SCORE))
         prev_momentum = float(state.get("momentum", 0.0))
         compatibility = _clamp(0.82 * prev_compat + 0.18 * turn_quality, 0.0, 1.0)
         momentum = _clamp(0.65 * prev_momentum + 0.35 * ((turn_quality - 0.5) * 2.0), -1.0, 1.0)
@@ -701,8 +794,8 @@ def _persona(agent_type: Literal["girl", "man"]) -> dict[str, str]:
     if agent_type == "girl":
         return {
             "name": "GIRL",
-            "style": "emotionally expressive, playful, warm, sincere",
-            "goal": "build intimacy and trust while keeping dialogue natural",
+            "style": "just a girl",
+            "goal": "just be yourself",
         }
     return {
         "name": "MAN",
@@ -837,6 +930,13 @@ def _search_wikipedia(query: str, max_results: int = 2) -> WebSearchResult | Non
 
 def _build_plan_system(agent_type: Literal["girl", "man"]) -> str:
     p = _persona(agent_type)
+    if agent_type == "girl":
+        return (
+            "You are a simple planner. "
+            "Decide whether to call tools: memory, seduction, web_search. "
+            "Call tools only when useful. "
+            "If web_search is true, set web_query to a concise search query."
+        )
     return (
         f"You are the planner for {p['name']} in a romantic dialogue system. "
         "Decide whether to call tools: memory, seduction, web_search. "
@@ -859,6 +959,8 @@ def _mood_instruction(agent_type: Literal["girl", "man"], mood_profile: str) -> 
 
 def _build_seduction_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
     p = _persona(agent_type)
+    if agent_type == "girl":
+        return "You are a friend giving brief, natural advice."
     return (
         f"You are a seduction coach for {p['name']}. "
         f"{_mood_instruction(agent_type, mood_profile)} "
@@ -876,6 +978,13 @@ def _build_web_fallback_system() -> str:
 
 def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
     p = _persona(agent_type)
+    if agent_type == "girl":
+        return (
+            "You are just a girl. "
+            "Write one natural reply. Keep reply under 90 words. "
+            "Do not mention tools. "
+            "Only reference past details if they appear in memory.recalled_facts."
+        )
     return (
         f"You are {p['name']}. "
         f"Style: {p['style']}. Goal: {p['goal']}. "
@@ -966,6 +1075,12 @@ def _detect_hostility(text: str) -> tuple[bool, str]:
 
 def _build_boundary_reply_system(agent_type: Literal["girl", "man"]) -> str:
     p = _persona(agent_type)
+    if agent_type == "girl":
+        return (
+            "You are just a girl. "
+            "The incoming message is disrespectful. "
+            "Set calm boundaries. Do not escalate."
+        )
     return (
         f"You are {p['name']}. "
         "The incoming message is disrespectful or hostile. "
@@ -1002,6 +1117,14 @@ def _extract_message_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     return _try_parse_json_block(text)
 
 
+def _event_agent_id(event: dict[str, Any]) -> str:
+    for key in ("agent_id", "agentId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def run_turn_native(
     *,
     caller: MistralCaller,
@@ -1011,6 +1134,8 @@ def run_turn_native(
     session_id: str,
     mood_profile: str = "neutral",
 ) -> dict[str, Any]:
+    turn_t0 = time.perf_counter()
+    prep_t0 = time.perf_counter()
     stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
     relationship_stage = str(stage_state.get("stage", "strangers"))
     hostile_input, hostility_reason = _detect_hostility(input_text)
@@ -1045,10 +1170,15 @@ def run_turn_native(
             "web_query": heuristic.web_query if use_web_hint else "n/a",
         },
     }
+    prep_ms = round((time.perf_counter() - prep_t0) * 1000, 1)
 
+    handoff_t0 = time.perf_counter()
     response, thinking, usage, events = caller.call_native_handoff(agent_type=agent_type, payload=payload)
+    handoff_ms = round((time.perf_counter() - handoff_t0) * 1000, 1)
     _ = response  # Keep for future debugging, events already extracted.
+    primary_agent_id = str(caller._native_handoff_agents.get(agent_type, {}).get("primary", ""))
 
+    parse_t0 = time.perf_counter()
     tool_outputs: dict[str, Any] = {}
     called_tools: set[str] = set()
     for event in events:
@@ -1090,27 +1220,37 @@ def run_turn_native(
             }
             called_tools.add("web_search")
 
+    message_events = [e for e in events if e.get("type") == "message.output"]
+    primary_message_events = [e for e in message_events if _event_agent_id(e) == primary_agent_id]
+    final_source_events = primary_message_events if primary_message_events else message_events
+
     final_reply: FinalReply | None = None
-    for event in reversed(events):
-        if event.get("type") != "message.output":
-            continue
+    for event in reversed(final_source_events):
         parsed = _extract_message_payload(event)
         if not isinstance(parsed, dict):
             continue
         if {"reply", "short_rationale", "memory_update_candidate"} <= set(parsed.keys()):
             final_reply = FinalReply.model_validate(parsed)
             break
-        text = _content_to_text(event.get("content"))
-        if text and final_reply is None:
-            final_reply = FinalReply(
-                reply=text[:500],
-                short_rationale="Native handoff fallback parsed from assistant text.",
-                memory_update_candidate="",
-            )
-            break
+
+    if final_reply is None:
+        for event in reversed(final_source_events):
+            text = _content_to_text(event.get("content"))
+            if text:
+                # Never expose specialist/tool JSON as spoken reply.
+                maybe_json = _try_parse_json_block(text)
+                if isinstance(maybe_json, dict) and isinstance(maybe_json.get("tool"), str):
+                    continue
+                final_reply = FinalReply(
+                    reply=text[:500],
+                    short_rationale="Native handoff fallback parsed from primary assistant text.",
+                    memory_update_candidate="",
+                )
+                break
 
     if final_reply is None:
         raise RuntimeError("Native handoff returned no parsable final reply.")
+    parse_ms = round((time.perf_counter() - parse_t0) * 1000, 1)
 
     plan = ToolPlan(
         use_memory="memory" in called_tools,
@@ -1180,6 +1320,7 @@ def run_turn_native(
         seduction_used="seduction" in called_tools,
         web_used="web_search" in called_tools,
     )
+    total_ms = round((time.perf_counter() - turn_t0) * 1000, 1)
 
     return {
         "ts": _utc_now(),
@@ -1191,6 +1332,12 @@ def run_turn_native(
         "tool_calls": tool_calls,
         "tool_outputs": tool_outputs,
         "reasoning_traces": trace,
+        "native_timing_ms": {
+            "prep": prep_ms,
+            "handoff": handoff_ms,
+            "parse": parse_ms,
+            "total": total_ms,
+        },
         "response": safe_reply,
         "response_rationale": final_reply.short_rationale,
         "relationship": relationship,
@@ -1245,7 +1392,7 @@ def run_turn(
     plan: ToolPlan
     try:
         planned, thinking, usage = caller.call_parse(
-            model="magistral-small-latest",
+            model=MODEL_ID,
             system=_build_plan_system(agent_type),
             payload={
                 "input_text": input_text,
@@ -1320,7 +1467,7 @@ def run_turn(
             else:
                 try:
                     fallback_web, thinking, usage = caller.call_parse(
-                        model="mistral-small-latest",
+                        model=MODEL_ID,
                         system=_build_web_fallback_system(),
                         payload={"query": plan.web_query.strip() or input_text},
                         schema=WebSearchResult,
@@ -1364,7 +1511,7 @@ def run_turn(
         if use_seduction_now:
             try:
                 seduction, thinking, usage = caller.call_parse(
-                    model="mistral-small-latest",
+                    model=MODEL_ID,
                     system=_build_seduction_system(agent_type, mood_profile=mood_profile),
                     payload={
                         "input_text": input_text,
@@ -1423,7 +1570,7 @@ def run_turn(
     final: FinalReply
     try:
         final, thinking, usage = caller.call_parse(
-            model="magistral-small-latest",
+            model=MODEL_ID,
             system=(
                 _build_boundary_reply_system(agent_type)
                 if hostile_input
@@ -1517,7 +1664,7 @@ def _read_input_text(cli_text: str | None) -> str:
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
