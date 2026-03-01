@@ -1,0 +1,14 @@
+[project]
+name = "amour-exe"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "elevenlabs>=2.37.0",
+    "mistralai[realtime]>=1.12.4",
+    "pyaudio>=0.2.14",
+    "pygame>=2.6.1",
+    "python-dotenv>=1.2.1",
+    "weave>=0.52.29",
+]
