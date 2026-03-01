@@ -228,22 +228,59 @@ class MemoryStore:
     def _save(self, data: dict[str, Any]) -> None:
         self.path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
 
+    def _session(self, data: dict[str, Any], session_id: str) -> dict[str, Any]:
+        session = data.setdefault(session_id, {})
+        if "agents" not in session:
+            legacy_messages = session.get("messages", [])
+            legacy_facts = session.get("facts", [])
+            legacy_relationship = session.get("relationship")
+            session["agents"] = {
+                "girl": {"messages": [], "facts": [], "relationship": None},
+                "man": {"messages": [], "facts": [], "relationship": None},
+            }
+            if legacy_messages:
+                session["agents"]["girl"]["messages"] = legacy_messages
+                session["agents"]["man"]["messages"] = legacy_messages
+            if legacy_facts:
+                session["agents"]["girl"]["facts"] = legacy_facts
+                session["agents"]["man"]["facts"] = legacy_facts
+            if legacy_relationship:
+                session["agents"]["girl"]["relationship"] = legacy_relationship
+                session["agents"]["man"]["relationship"] = legacy_relationship
+            session.pop("messages", None)
+            session.pop("facts", None)
+            session.pop("relationship", None)
+        return session
+
+    def _agent_bucket(self, data: dict[str, Any], session_id: str, owner: str) -> dict[str, Any]:
+        session = self._session(data, session_id)
+        agents = session.setdefault("agents", {})
+        bucket = agents.setdefault(owner, {"messages": [], "facts": [], "relationship": None})
+        bucket.setdefault("messages", [])
+        bucket.setdefault("facts", [])
+        return bucket
+
     def reset_session(self, session_id: str) -> None:
         data = self._load()
         if session_id in data:
-            data[session_id] = {"messages": [], "facts": []}
+            data[session_id] = {
+                "agents": {
+                    "girl": {"messages": [], "facts": [], "relationship": None},
+                    "man": {"messages": [], "facts": [], "relationship": None},
+                }
+            }
             self._save(data)
 
-    def append_message(self, session_id: str, speaker: str, text: str) -> None:
+    def append_message(self, session_id: str, owner: str, speaker: str, text: str) -> None:
         data = self._load()
-        session = data.setdefault(session_id, {"messages": [], "facts": []})
-        session["messages"].append({"speaker": speaker, "text": text, "ts": _utc_now()})
+        bucket = self._agent_bucket(data, session_id, owner)
+        bucket["messages"].append({"speaker": speaker, "text": text, "ts": _utc_now()})
         self._save(data)
 
-    def get_relationship_state(self, session_id: str) -> dict[str, Any]:
+    def get_relationship_state(self, session_id: str, owner: str) -> dict[str, Any]:
         data = self._load()
-        session = data.setdefault(session_id, {"messages": [], "facts": []})
-        state = session.get("relationship")
+        bucket = self._agent_bucket(data, session_id, owner)
+        state = bucket.get("relationship")
         if not isinstance(state, dict):
             state = {
                 "compatibility_score": 0.5,
@@ -253,13 +290,14 @@ class MemoryStore:
                 "turns": 0,
                 "history": [],
             }
-            session["relationship"] = state
+            bucket["relationship"] = state
             self._save(data)
         return state
 
     def update_relationship_state(
         self,
         session_id: str,
+        owner: str,
         *,
         input_text: str,
         response_text: str,
@@ -268,13 +306,13 @@ class MemoryStore:
         web_used: bool,
     ) -> dict[str, Any]:
         data = self._load()
-        session = data.setdefault(session_id, {"messages": [], "facts": []})
-        state = session.get("relationship")
+        bucket = self._agent_bucket(data, session_id, owner)
+        state = bucket.get("relationship")
         if not isinstance(state, dict):
-            state = self.get_relationship_state(session_id)
+            state = self.get_relationship_state(session_id, owner)
             data = self._load()
-            session = data.setdefault(session_id, {"messages": [], "facts": []})
-            state = session.get("relationship", {})
+            bucket = self._agent_bucket(data, session_id, owner)
+            state = bucket.get("relationship", {})
 
         turns = int(state.get("turns", 0)) + 1
         input_sent = _sentiment_score(input_text)
@@ -336,7 +374,7 @@ class MemoryStore:
         # Keep history bounded.
         if len(history) > 200:
             state["history"] = history[-200:]
-        session["relationship"] = state
+        bucket["relationship"] = state
         self._save(data)
         return state
 
@@ -370,6 +408,7 @@ class MemoryStore:
     def append_fact(
         self,
         session_id: str,
+        owner: str,
         fact: str,
         *,
         source_text: str,
@@ -378,8 +417,8 @@ class MemoryStore:
         verified: bool = False,
     ) -> None:
         data = self._load()
-        session = data.setdefault(session_id, {"messages": [], "facts": []})
-        facts = self._normalize_facts(session.setdefault("facts", []))
+        bucket = self._agent_bucket(data, session_id, owner)
+        facts = self._normalize_facts(bucket.setdefault("facts", []))
         if fact and not any(f["fact"] == fact for f in facts):
             facts.append(
                 {
@@ -391,14 +430,14 @@ class MemoryStore:
                     "ts": _utc_now(),
                 }
             )
-        session["facts"] = facts
+        bucket["facts"] = facts
         self._save(data)
 
-    def recall(self, session_id: str, query: str, limit: int = 3) -> dict[str, Any]:
+    def recall(self, session_id: str, owner: str, query: str, limit: int = 3) -> dict[str, Any]:
         data = self._load()
-        session = data.get(session_id, {"messages": [], "facts": []})
-        fact_rows = self._normalize_facts(session.get("facts", []))
-        messages: list[dict[str, str]] = session.get("messages", [])
+        bucket = self._agent_bucket(data, session_id, owner)
+        fact_rows = self._normalize_facts(bucket.get("facts", []))
+        messages: list[dict[str, str]] = bucket.get("messages", [])
         words = set(re.findall(r"[a-zA-Z']+", query.lower()))
         scored: list[tuple[int, float, dict[str, Any]]] = []
         for row in fact_rows:
@@ -611,7 +650,7 @@ def run_turn(
 
     for _ in range(MAX_TOOL_ROUNDS):
         if plan.use_memory:
-            mem = memory_store.recall(session_id=session_id, query=input_text, limit=3)
+            mem = memory_store.recall(session_id=session_id, owner=agent_type, query=input_text, limit=3)
             fact_candidate = _extract_fact_candidate(input_text)
             should_store = bool(fact_candidate)
             mem["should_store_new_memory"] = should_store
@@ -753,11 +792,17 @@ def run_turn(
 
     # Update memory with the other agent message and useful extracted facts.
     other_speaker = "man" if agent_type == "girl" else "girl"
-    memory_store.append_message(session_id=session_id, speaker=other_speaker, text=input_text)
+    memory_store.append_message(
+        session_id=session_id,
+        owner=agent_type,
+        speaker=other_speaker,
+        text=input_text,
+    )
     fact_candidate = _extract_fact_candidate(input_text)
     if fact_candidate:
         memory_store.append_fact(
             session_id=session_id,
+            owner=agent_type,
             fact=fact_candidate,
             source_text=input_text,
             speaker=other_speaker,
@@ -768,6 +813,7 @@ def run_turn(
     safe_reply = _sanitize_reply_for_memory(final.reply, tool_outputs.get("memory", {}))
     relationship = memory_store.update_relationship_state(
         session_id=session_id,
+        owner=agent_type,
         input_text=input_text,
         response_text=safe_reply,
         memory_used=plan.use_memory,
