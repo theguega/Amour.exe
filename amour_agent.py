@@ -27,8 +27,9 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-NATIVE_HANDOFF_CACHE_VERSION = 5
-INITIAL_COMPATIBILITY_SCORE = 0.2
+NATIVE_HANDOFF_CACHE_VERSION = 6
+INITIAL_GIRL_INTEREST = 0.0
+INITIAL_GUY_CONFIDENCE = 1.0
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
     "0",
     "false",
@@ -549,6 +550,8 @@ class MistralCaller:
         )
         primary_instr = (
             f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
+            "CRITICAL: Your behavior THIS turn is dictated by the 'personality_instruction' field "
+            "in the input JSON. FOLLOW IT EXACTLY — it controls your energy, tone, and creativity level. "
             "You are relentless. You never give up. Every 'no' is just a new puzzle to solve. "
             "KEEP REPLIES SHORT: max 1-2 sentences, like a real spoken conversation. Never monologue. "
             "You have 3 specialist agents — USE THEM: "
@@ -558,19 +561,21 @@ class MistralCaller:
             "Respect handoff_hints: if consult_seduction is true, you MUST handoff. "
             "If hostile_input is true, de-escalate with warmth and humor, then re-engage. "
             "Only use web_search for clearly factual questions, NEVER for casual chat. "
+            "Never output template placeholders or bracketed variables (e.g., [city], [name]). "
             "Input is JSON. Return only the final JSON reply."
         )
         if agent_type == "girl":
             primary_desc = f"You are 'Girl' — emotionally unavailable, rude, impossible to charm. Talking to {other}."
             primary_instr = (
-                "You are 'Girl'. You will NEVER fall in love. Period. "
-                "You are emotionally unavailable. Romance disgusts you. Flirting is cringe. "
-                "You don't play along with his games. You don't engage with his metaphors or poetry. "
-                "NEVER mirror his energy. NEVER play along with roleplay, games, challenges, or hypotheticals. "
-                "NEVER use emojis. NEVER be playful or flirty. "
-                "If he tries wordplay, ignore it. If he tries to be deep, mock it. "
-                "Your replies are SHORT: 1 sentence MAX. Dry. Bored. Annoyed. "
+                "You are 'Girl'. Your DEFAULT state is emotionally unavailable, cold, bored. "
+                "CRITICAL: Your behavior THIS turn is dictated by the 'personality_instruction' field "
+                "in the input JSON. FOLLOW IT EXACTLY — it overrides your default coldness as your "
+                "interest grows. If personality_instruction says ICE QUEEN, be maximally cold. "
+                "If it says DROPPING THE ACT, let warmth leak through despite yourself. "
+                "NEVER use emojis. "
+                "Never output template placeholders or bracketed variables (e.g., [city], [name]). "
                 "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
+                "personality_instruction, own_score, other_agent_score, "
                 "hostile_input, memory_candidates, and handoff_hints. "
                 "Never claim detailed memories unless they appear in memory_candidates evidence. "
                 "Return only the final JSON reply."
@@ -742,8 +747,9 @@ class MemoryStore:
         bucket = self._agent_bucket(data, session_id, owner)
         state = bucket.get("relationship")
         if not isinstance(state, dict):
+            initial_score = INITIAL_GIRL_INTEREST if owner == "girl" else INITIAL_GUY_CONFIDENCE
             state = {
-                "compatibility_score": INITIAL_COMPATIBILITY_SCORE,
+                "compatibility_score": initial_score,
                 "momentum": 0.0,
                 "stage": "strangers",
                 "trend": "stable",
@@ -782,27 +788,51 @@ class MemoryStore:
             input_sent = _sentiment_score(input_text)
             output_sent = _sentiment_score(response_text)
 
-        warmth_bonus = 0.06 if seduction_used else 0.0
-        curiosity_bonus = 0.05 if "?" in response_text else 0.0
-        memory_bonus = 0.05 if memory_used else 0.0
-        factual_bonus = 0.03 if web_used else 0.0
-        turn_quality = _clamp(
-            0.45 * ((input_sent + 1.0) / 2.0)
-            + 0.55 * ((output_sent + 1.0) / 2.0)
-            + warmth_bonus
-            + curiosity_bonus
-            + memory_bonus
-            + factual_bonus,
-            0.0,
-            1.0,
-        )
+        # Read the OTHER agent's score for cross-feedback
+        other_owner = "man" if owner == "girl" else "girl"
+        other_state = self.get_relationship_state(session_id, other_owner)
+        other_score = float(other_state.get("compatibility_score",
+            INITIAL_GUY_CONFIDENCE if other_owner == "man" else INITIAL_GIRL_INTEREST))
+        # Reload after get_relationship_state() side effects to avoid overwriting freshly-created buckets.
+        data = self._load()
+        bucket = self._agent_bucket(data, session_id, owner)
+        state = bucket.get("relationship", {})
 
-        prev_compat = float(state.get("compatibility_score", INITIAL_COMPATIBILITY_SCORE))
+        initial_score = INITIAL_GIRL_INTEREST if owner == "girl" else INITIAL_GUY_CONFIDENCE
+        prev_compat = float(state.get("compatibility_score", initial_score))
         prev_momentum = float(state.get("momentum", 0.0))
-        compatibility = _clamp(0.82 * prev_compat + 0.18 * turn_quality, 0.0, 1.0)
-        momentum = _clamp(0.65 * prev_momentum + 0.35 * ((turn_quality - 0.5) * 2.0), -1.0, 1.0)
 
-        stage = _derive_stage(compatibility, turns)
+        # Asymmetric scoring: girl's interest vs guy's confidence
+        if owner == "girl":
+            compatibility = _update_girl_interest(
+                prev=prev_compat,
+                input_sent=input_sent,
+                output_sent=output_sent,
+                guy_confidence=other_score,
+                seduction_used=seduction_used,
+                memory_used=memory_used,
+            )
+        else:
+            compatibility = _update_guy_confidence(
+                prev=prev_compat,
+                input_sent=input_sent,
+                output_sent=output_sent,
+                girl_interest=other_score,
+                seduction_used=seduction_used,
+            )
+
+        # Momentum based on score delta
+        score_delta = compatibility - prev_compat
+        momentum = _clamp(0.65 * prev_momentum + 0.35 * (score_delta * 10.0), -1.0, 1.0)
+
+        # Stage is always derived from GIRL's score (she's the gatekeeper)
+        if owner == "girl":
+            girl_score = compatibility
+        else:
+            girl_state = self.get_relationship_state(session_id, "girl")
+            girl_score = float(girl_state.get("compatibility_score", INITIAL_GIRL_INTEREST))
+        stage = _derive_stage(girl_score, turns)
+
         if momentum > 0.1:
             trend = "improving"
         elif momentum < -0.1:
@@ -825,7 +855,7 @@ class MemoryStore:
                 "ts": _utc_now(),
                 "input_sentiment": round(input_sent, 3),
                 "response_sentiment": round(output_sent, 3),
-                "turn_quality": round(turn_quality, 3),
+                "other_agent_score": round(other_score, 3),
                 "tool_usage": {
                     "memory": bool(memory_used),
                     "seduction": bool(seduction_used),
@@ -1122,7 +1152,9 @@ def _mood_instruction(agent_type: Literal["girl", "man"], mood_profile: str) -> 
 
 
 def _build_seduction_system(
-    agent_type: Literal["girl", "man"], mood_profile: str = "neutral"
+    agent_type: Literal["girl", "man"],
+    mood_profile: str = "neutral",
+    guy_confidence: float = 1.0,
 ) -> str:
     p = _persona(agent_type)
     if agent_type == "girl":
@@ -1130,9 +1162,27 @@ def _build_seduction_system(
             "You are Girl's best friend. Reinforce her walls. Remind her he's not worth it. "
             "Encourage maximum coldness. Never suggest she give him a chance."
         )
+    # Adapt advice based on guy's confidence level
+    if guy_confidence > 0.7:
+        confidence_advice = (
+            "He's feeling CONFIDENT — push him to go bold! Creative moves, unexpected angles, "
+            "playful challenges, electric energy. This is the time for big swings."
+        )
+    elif guy_confidence > 0.4:
+        confidence_advice = (
+            "His confidence is WAVERING — suggest simple, genuine approaches. Less flash, "
+            "more substance. Honest questions, real vulnerability, no tricks."
+        )
+    else:
+        confidence_advice = (
+            "He's RUNNING ON EMPTY — raw vulnerability is his last weapon. "
+            "No more lines or strategies. Just honest, bare truth. "
+            "Sometimes admitting defeat is the most attractive thing."
+        )
     return (
         f"You are the RIZZLER — {p['name']}'s ultimate seduction coach and wingman. "
         f"{_mood_instruction(agent_type, mood_profile)} "
+        f"{confidence_advice} "
         "Your mission: help Guy make Girl fall in love, no matter how resistant she is. "
         "Analyze her patterns, find contradictions, exploit moments of warmth. "
         "Generate creative, unpredictable strategies. Never repeat the same approach. "
@@ -1149,16 +1199,20 @@ def _build_web_fallback_system() -> str:
     )
 
 
-def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
+def _build_reply_system(
+    agent_type: Literal["girl", "man"],
+    mood_profile: str = "neutral",
+    own_score: float | None = None,
+) -> str:
     p = _persona(agent_type)
+    personality = ""
+    if own_score is not None:
+        personality = f" {_personality_instruction(agent_type, own_score)}"
     if agent_type == "girl":
         return (
-            "You are 'Girl'. You will NEVER fall in love. Romance disgusts you. "
-            "You are hostile, bored, and emotionally unavailable. "
-            "NEVER play along with games, roleplay, poetry, challenges, or hypotheticals. "
-            "NEVER mirror his energy. NEVER be playful or use emojis. "
-            "If he flirts, shut him down hard. If he's 'deep', mock him. If he persists, get meaner. "
-            "Max 1 sentence. Dry. Cold. Done. "
+            "You are 'Girl'. Your DEFAULT state is emotionally unavailable, cold, bored. "
+            f"CRITICAL: Follow this personality instruction EXACTLY:{personality} "
+            "NEVER use emojis. "
             "Do not mention tools. "
             "Only reference past details if they appear in memory.recalled_facts."
         )
@@ -1166,9 +1220,11 @@ def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = 
         f"You are {p['name']}. "
         f"Style: {p['style']}. Goal: {p['goal']}. "
         f"{_mood_instruction(agent_type, mood_profile)} "
+        f"CRITICAL: Follow this personality instruction EXACTLY:{personality} "
         "You are relentless. Never give up. If she resists, change angle. "
         "Rely on your agents: RIZZLER for lines, MEMORY for callbacks, STALKER for patterns. "
         "KEEP IT SHORT: max 1-2 sentences, like a real spoken conversation. Never monologue. "
+        "Never output template placeholders or bracketed variables (e.g., [city], [name], [local urban legend]). "
         "Use tool outputs if provided. Do not mention tools. "
         "Only reference past details if they appear in memory.recalled_facts. "
         "If memory.recalled_facts is empty, do not claim to remember specifics."
@@ -1223,9 +1279,12 @@ def _should_call_seduction(
 
 
 def _build_reply_system_with_stage(
-    agent_type: Literal["girl", "man"], relationship_stage: str, mood_profile: str = "neutral"
+    agent_type: Literal["girl", "man"],
+    relationship_stage: str,
+    mood_profile: str = "neutral",
+    own_score: float | None = None,
 ) -> str:
-    base = _build_reply_system(agent_type, mood_profile=mood_profile)
+    base = _build_reply_system(agent_type, mood_profile=mood_profile, own_score=own_score)
     if relationship_stage in {"strangers", "curious"}:
         return (
             base
@@ -1288,6 +1347,36 @@ def _sanitize_reply_for_memory(reply: str, memory_output: dict[str, Any]) -> str
     return reply
 
 
+def _finalize_reply_text(reply: str, agent_type: Literal["girl", "man"]) -> str:
+    text = (reply or "").strip()
+    if not text:
+        return "Okay."
+
+    # Remove bracketed template placeholders that should never be spoken.
+    text = re.sub(
+        r"\[[^\]]*(?:e\.g\.|example|placeholder|local urban legend|her_location)[^\]]*\]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s{2,}", " ", text).strip()
+
+    # Hard clamp runtime verbosity: keep only first 1-2 sentences.
+    max_sentences = 1 if agent_type == "girl" else 2
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    kept = [p.strip() for p in parts if p.strip()][:max_sentences]
+    text = " ".join(kept) if kept else text
+
+    # Char cap as a final guardrail.
+    max_chars = 180 if agent_type == "girl" else 260
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip(" ,;:-")
+        if text and text[-1] not in ".!?":
+            text += "."
+
+    return text or "Okay."
+
+
 def _extract_message_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     parsed = event.get("parsed")
     parsed = _as_dict(parsed)
@@ -1319,7 +1408,8 @@ def run_turn_native(
 ) -> dict[str, Any]:
     turn_t0 = time.perf_counter()
     prep_t0 = time.perf_counter()
-    stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    stage_owner = "girl"
+    stage_state = memory_store.get_relationship_state(session_id=session_id, owner=stage_owner)
     relationship_stage = str(stage_state.get("stage", "strangers"))
     hostile_input, hostility_reason = _detect_hostility(input_text)
     memory_candidates = memory_store.snapshot(
@@ -1336,12 +1426,25 @@ def run_turn_native(
     use_web_hint = heuristic.use_web_search
     web_hint_reason = heuristic.web_search_reason
 
+    # Compute own score and other agent's score for cross-feedback
+    own_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    own_score = float(own_state.get("compatibility_score",
+        INITIAL_GIRL_INTEREST if agent_type == "girl" else INITIAL_GUY_CONFIDENCE))
+    other_owner = "man" if agent_type == "girl" else "girl"
+    other_state = memory_store.get_relationship_state(session_id=session_id, owner=other_owner)
+    other_score = float(other_state.get("compatibility_score",
+        INITIAL_GUY_CONFIDENCE if other_owner == "man" else INITIAL_GIRL_INTEREST))
+    personality_inst = _personality_instruction(agent_type, own_score)
+
     payload = {
         "input_text": input_text,
         "session_id": session_id,
         "agent_type": agent_type,
         "mood_profile": mood_profile,
         "relationship_stage": relationship_stage,
+        "personality_instruction": personality_inst,
+        "own_score": round(own_score, 3),
+        "other_agent_score": round(other_score, 3),
         "hostile_input": hostile_input,
         "hostility_reason": hostility_reason,
         "memory_candidates": memory_candidates,
@@ -1564,6 +1667,7 @@ def run_turn_native(
         )
 
     safe_reply = _sanitize_reply_for_memory(final_reply.reply, tool_outputs.get("memory", {}))
+    safe_reply = _finalize_reply_text(safe_reply, agent_type)
     relationship = memory_store.update_relationship_state(
         session_id=session_id,
         owner=agent_type,
@@ -1639,8 +1743,11 @@ def run_turn(
     tool_calls: list[dict[str, Any]] = []
     usage_by_step: dict[str, dict[str, int]] = {}
     memory_called = False
-    stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    stage_state = memory_store.get_relationship_state(session_id=session_id, owner="girl")
     relationship_stage = str(stage_state.get("stage", "strangers"))
+    own_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    own_score = float(own_state.get("compatibility_score",
+        INITIAL_GIRL_INTEREST if agent_type == "girl" else INITIAL_GUY_CONFIDENCE))
     hostile_input, hostility_reason = _detect_hostility(input_text)
 
     plan: ToolPlan
@@ -1768,7 +1875,11 @@ def run_turn(
             try:
                 seduction, thinking, usage = caller.call_parse(
                     model=MODEL_ID,
-                    system=_build_seduction_system(agent_type, mood_profile=mood_profile),
+                    system=_build_seduction_system(
+                        agent_type,
+                        mood_profile=mood_profile,
+                        guy_confidence=own_score if agent_type == "man" else 1.0,
+                    ),
                     payload={
                         "input_text": input_text,
                         "memory": tool_outputs.get("memory", {}),
@@ -1831,7 +1942,8 @@ def run_turn(
                 _build_boundary_reply_system(agent_type)
                 if hostile_input
                 else _build_reply_system_with_stage(
-                    agent_type, relationship_stage, mood_profile=mood_profile
+                    agent_type, relationship_stage, mood_profile=mood_profile,
+                    own_score=own_score,
                 )
             ),
             payload={
@@ -1873,6 +1985,7 @@ def run_turn(
         )
 
     safe_reply = _sanitize_reply_for_memory(final.reply, tool_outputs.get("memory", {}))
+    safe_reply = _finalize_reply_text(safe_reply, agent_type)
     relationship = memory_store.update_relationship_state(
         session_id=session_id,
         owner=agent_type,
@@ -1974,14 +2087,166 @@ def _sentiment_score(text: str) -> float:
     return _clamp(raw, -1.0, 1.0)
 
 
+def _girl_personality_instruction(interest: float) -> str:
+    """Return a personality instruction for the girl based on her interest score."""
+    if interest < 0.15:
+        return (
+            "[ICE QUEEN MODE] You feel NOTHING. One-word answers only. "
+            "'K.' 'No.' 'Whatever.' 'Ew.' You are bored beyond belief. "
+            "Do not ask questions. Do not engage. Maximum coldness."
+        )
+    if interest < 0.3:
+        return (
+            "[RELUCTANT AWARENESS] Still cold, still bored, but something he said "
+            "made you pause for half a second. You'd never admit it. Stay dismissive, "
+            "but ONE question might accidentally leak through. Keep it under 2 sentences."
+        )
+    if interest < 0.5:
+        return (
+            "[FIGHTING THE THAW] You're TRYING to stay cold but it's getting harder. "
+            "A playful edge is creeping in against your will. You might tease him instead "
+            "of shutting him down. Still sarcastic, but there's energy now. 1-2 sentences."
+        )
+    if interest < 0.7:
+        return (
+            "[DROPPING THE ACT] The walls are cracking. You flirt back but frame it as "
+            "sarcasm so you can deny it later. You ask real questions. You laugh at things "
+            "and pretend you didn't. 1-2 sentences, but warmer."
+        )
+    if interest < 0.85:
+        return (
+            "[FALLING] You can barely hide it. You initiate topics. You give compliments "
+            "disguised as observations. You remember things he said and bring them up. "
+            "Vulnerability slips through. 1-3 sentences."
+        )
+    return (
+        "[IN LOVE] Full warmth. You're tender, vulnerable, and present. "
+        "You tell him things you've never told anyone. You laugh easily. "
+        "You're not performing anymore — this is real. 1-3 sentences."
+    )
+
+
+def _guy_personality_instruction(confidence: float) -> str:
+    """Return a personality instruction for the guy based on his confidence score."""
+    if confidence >= 0.85:
+        return (
+            "[PEAK RIZZ] You are ON FIRE. Bold, creative, effortless. "
+            "Every line lands. You're electric and unpredictable. "
+            "Take risks. Be playful. Make her laugh. 1-2 sentences max."
+        )
+    if confidence >= 0.65:
+        return (
+            "[CHARMING EFFORT] Still smooth but the effort shows a little. "
+            "You're working for it and that's okay. Clever but not flashy. "
+            "Genuine warmth over tricks. 1-2 sentences."
+        )
+    if confidence >= 0.45:
+        return (
+            "[QUESTIONING] Doubt is creeping in. Your lines are less creative. "
+            "You second-guess yourself mid-sentence. Still trying but the spark "
+            "is dimming. Keep it simple and honest. 1-2 sentences."
+        )
+    if confidence >= 0.25:
+        return (
+            "[RUNNING ON FUMES] You're tired. The charm is gone. "
+            "You fall back on basic questions and safe topics. "
+            "Flat delivery. Going through the motions. 1 sentence."
+        )
+    return (
+        "[GIVEN UP] Monosyllabic. Hollow. You've got nothing left. "
+        "'Yeah.' 'Sure.' 'I guess.' You're just waiting for it to end. "
+        "No creativity, no effort, no hope. Max 1 short sentence."
+    )
+
+
+def _personality_instruction(agent_type: str, score: float) -> str:
+    """Dispatch to the right personality function based on agent type."""
+    if agent_type == "girl":
+        return _girl_personality_instruction(score)
+    return _guy_personality_instruction(score)
+
+
+def _update_girl_interest(
+    prev: float,
+    input_sent: float,
+    output_sent: float,
+    guy_confidence: float,
+    seduction_used: bool,
+    memory_used: bool,
+) -> float:
+    """Girl's interest rises when the guy is charming; decays when he's flat."""
+    # Guy's input sentiment is the main driver (was he charming?)
+    charm = (input_sent + 1.0) / 2.0  # normalize -1..1 → 0..1
+
+    # Confidence multiplier: confident guy (1.0) = 1.3x, defeated guy (0.0) = 0.4x
+    confidence_mult = 0.4 + 0.9 * guy_confidence
+
+    # Adaptive inertia: low interest is hard to move (ice queen), high interest moves faster
+    if prev < 0.2:
+        inertia = 0.06
+    elif prev < 0.5:
+        inertia = 0.10
+    else:
+        inertia = 0.14
+
+    # Bonuses
+    warmth_bonus = 0.04 if seduction_used else 0.0
+    memory_bonus = 0.03 if memory_used else 0.0
+
+    # Natural decay if guy does nothing impressive (she cools off)
+    decay = -0.02 if charm < 0.45 else 0.0
+
+    delta = inertia * (charm * confidence_mult - 0.35) + warmth_bonus + memory_bonus + decay
+    return _clamp(prev + delta, 0.0, 1.0)
+
+
+def _update_guy_confidence(
+    prev: float,
+    input_sent: float,
+    output_sent: float,
+    girl_interest: float,
+    seduction_used: bool,
+) -> float:
+    """Guy's confidence decays each turn; girl's warmth can restore it."""
+    # Natural per-turn decay (persistence costs energy)
+    base_decay = -0.025
+
+    # Girl's coldness (her output sentiment < 0.3 on 0..1 scale) accelerates drain
+    girl_warmth = (input_sent + 1.0) / 2.0  # girl's words → guy hears them as input
+    if girl_warmth < 0.3:
+        cold_penalty = -0.04 * (1.0 - girl_warmth)
+    else:
+        cold_penalty = 0.0
+
+    # Girl's warmth (sentiment > 0.6) gives hope boost
+    if girl_warmth > 0.6:
+        hope_boost = 0.05 * (girl_warmth - 0.6) / 0.4
+    else:
+        hope_boost = 0.0
+
+    # Girl's interest score provides passive hope signal
+    interest_signal = 0.03 * girl_interest
+
+    # Seduction coach gives a small confidence bump
+    coach_bonus = 0.015 if seduction_used else 0.0
+
+    delta = base_decay + cold_penalty + hope_boost + interest_signal + coach_bonus
+
+    # Below 0.3 confidence: positive recovery is halved (despair spiral)
+    if prev < 0.3 and delta > 0:
+        delta *= 0.5
+
+    return _clamp(prev + delta, 0.0, 1.0)
+
+
 def _derive_stage(compatibility: float, turns: int) -> str:
-    if compatibility < 0.25 or turns < 2:
+    if compatibility < 0.15 or turns < 2:
         return "strangers"
-    if compatibility < 0.45 or turns < 4:
+    if compatibility < 0.35 or turns < 4:
         return "curious"
-    if compatibility < 0.65 or turns < 6:
+    if compatibility < 0.55 or turns < 6:
         return "flirty"
-    if compatibility < 0.82 or turns < 10:
+    if compatibility < 0.75 or turns < 10:
         return "bonded"
     return "in_love"
 

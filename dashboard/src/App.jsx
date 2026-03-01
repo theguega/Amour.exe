@@ -20,7 +20,7 @@ ChartJS.register(
   Legend
 );
 
-const STAGES = ['Strangers', 'Curious', 'Flirting', 'Couple'];
+const STAGES = ['Strangers', 'Curious', 'Flirty', 'Bonded', 'In_love'];
 
 function App() {
   const sessionStartTime = useRef(new Date().getTime());
@@ -34,7 +34,8 @@ function App() {
       guy: { joy: 0, curiosity: 0, nervousness: 0 },
     },
     stage: 'Strangers',
-    compatibility: 0,
+    girlInterest: 0,
+    guyConfidence: 1,
     momentum: 0,
     toolUsage: {
       memory: 0,
@@ -111,7 +112,7 @@ function App() {
 
           const input = trace.inputs?.result || {};
           const output = trace.output || {};
-          const agentType = input.agent_type;
+          const agentType = input.agent_type || output.agent_type;
 
           const words = output.general_stats?.words_spoken_ai || 0;
           const duration = output.general_stats?.duration || 0;
@@ -156,12 +157,19 @@ function App() {
             }
           }
 
-          if (!acc.relationshipSet && input.relationship) {
-            const rawStage = input.relationship.stage || 'strangers';
+          const rel = input.relationship || output.relationship_metrics;
+          if (rel) {
+            const rawStage = rel.stage || 'strangers';
             acc.stage = rawStage.charAt(0).toUpperCase() + rawStage.slice(1);
-            acc.compatibility = input.relationship.compatibility_score || 0;
-            acc.momentum = input.relationship.momentum || 0;
-            acc.relationshipSet = true;
+            acc.momentum = Number(rel.momentum) || 0;
+            const score = Number(rel.compatibility_score);
+            if (agentType === 'girl' && !acc.relationshipSet.girl) {
+              acc.girlInterest = isNaN(score) ? 0 : score;
+              acc.relationshipSet.girl = true;
+            } else if ((agentType === 'man' || agentType === 'guy') && !acc.relationshipSet.guy) {
+              acc.guyConfidence = isNaN(score) ? 1 : score;
+              acc.relationshipSet.guy = true;
+            }
           }
 
           return acc;
@@ -175,12 +183,13 @@ function App() {
             guy: { joy: 0, curiosity: 0, nervousness: 0 },
           },
           stage: 'Strangers',
-          compatibility: 0,
+          girlInterest: 0,
+          guyConfidence: 1,
           momentum: 0,
           toolUsage: { memory: 0, seduction: 0, web_search: 0 },
           agentHandoffs: {},
           emotionsSet: { girl: false, guy: false },
-          relationshipSet: false,
+          relationshipSet: { girl: false, guy: false },
           seenTraceIds: new Set()
         });
 
@@ -190,7 +199,8 @@ function App() {
           wordCount: aggregated.wordCount,
           emotions: aggregated.emotions,
           stage: aggregated.stage,
-          compatibility: aggregated.compatibility,
+          girlInterest: aggregated.girlInterest,
+          guyConfidence: aggregated.guyConfidence,
           momentum: aggregated.momentum,
           toolUsage: aggregated.toolUsage,
           agentHandoffs: aggregated.agentHandoffs
@@ -292,8 +302,12 @@ function App() {
         <div className="pixel-box stats-panel">
           <h2>[ Stats ]</h2>
           <div className="stat-item">
-             <span className="stat-label">Compatibility Score:</span>
-             <span className="stat-value">{(currentMetrics.compatibility * 100).toFixed(1)}%</span>
+             <span className="stat-label">Girl Interest:</span>
+             <span className="stat-value" style={{ color: '#ff6f91' }}>{((currentMetrics.girlInterest || 0) * 100).toFixed(1)}%</span>
+          </div>
+          <div className="stat-item">
+             <span className="stat-label">Guy Confidence:</span>
+             <span className="stat-value" style={{ color: '#2ecc71' }}>{((currentMetrics.guyConfidence ?? 1) * 100).toFixed(1)}%</span>
           </div>
           <div className="stat-item">
              <span className="stat-label">Emotional Momentum:</span>
