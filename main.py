@@ -192,13 +192,17 @@ async def run_voice_loop(args) -> None:
     incoming = args.seed_text.strip() if args.seed_text else _fallback_prompt(args.type)
     turn_idx = 0
 
+    stt_silence = args.auto_silence_timeout_s if args.auto else args.silence_timeout_s
+    print(f"[config] auto={args.auto} silence_timeout={stt_silence}s auto_delay={args.auto_delay}s")
+
     if args.listen_first and not args.seed_text.strip():
-        await wait_for_spacebar("[press SPACE to start your first message]")
+        if not args.auto:
+            await wait_for_spacebar("[press SPACE to start your first message]")
         print("[stt] listen-first enabled: waiting for your input...")
         from voice_interaction.realtime_tts import listen_and_transcribe
 
         heard = await listen_and_transcribe(
-            silence_timeout_s=args.silence_timeout_s,
+            silence_timeout_s=stt_silence,
             noise_calibration_s=args.noise_calibration_s,
             speech_ratio=args.speech_ratio,
         )
@@ -244,10 +248,14 @@ async def run_voice_loop(args) -> None:
         # Maybe hide it after audio finishes?
         await broadcast({"action": "stop_typing"})  # Ensure it's hidden after speaking
 
-        await wait_for_spacebar()
+        if args.auto:
+            print(f"[auto] waiting {args.auto_delay}s before listening...")
+            await asyncio.sleep(args.auto_delay)
+        else:
+            await wait_for_spacebar()
         print("[stt] listening for the other agent/user...")
         transcribed_text = await listen_and_transcribe(
-            silence_timeout_s=args.silence_timeout_s,
+            silence_timeout_s=stt_silence,
             noise_calibration_s=args.noise_calibration_s,
             speech_ratio=args.speech_ratio,
         )
@@ -420,9 +428,12 @@ def parse_args():
     parser.add_argument(
         "--listen-first", action="store_true", help="In voice mode, listen before first response."
     )
-    parser.add_argument("--silence-timeout-s", type=float, default=3.0)
+    parser.add_argument("--silence-timeout-s", type=float, default=5.0)
     parser.add_argument("--noise-calibration-s", type=float, default=1.0)
     parser.add_argument("--speech-ratio", type=float, default=2.5)
+    parser.add_argument("--auto", action="store_true", help="Auto-listen after TTS, no spacebar needed. For 2-computer setups.")
+    parser.add_argument("--auto-delay", type=float, default=2.5, help="Seconds to wait after TTS before listening (avoid echo).")
+    parser.add_argument("--auto-silence-timeout-s", type=float, default=8.0, help="Silence timeout when in auto mode (longer to avoid cutting off the other speaker).")
     return parser.parse_args()
 
 
