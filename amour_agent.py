@@ -28,14 +28,9 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-<<<<<<< HEAD
-NATIVE_HANDOFF_CACHE_VERSION = 6
+NATIVE_HANDOFF_CACHE_VERSION = 9
 INITIAL_GIRL_INTEREST = 0.0
 INITIAL_GUY_CONFIDENCE = 1.0
-=======
-NATIVE_HANDOFF_CACHE_VERSION = 9
-INITIAL_COMPATIBILITY_SCORE = 0.2
->>>>>>> try_telegram
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
     "0",
     "false",
@@ -1129,7 +1124,7 @@ def _heuristic_plan(input_text: str, relationship: dict[str, Any] | None = None)
         ]
     )
     
-    # Human help heuristic: periodic check-ins, stagnation, coldness, or tricky inputs
+    # Human help heuristic: use sparingly for clear stall or strong dismissiveness
     use_human = False
     human_reason = "No human consultation needed this turn."
     if relationship:
@@ -1137,27 +1132,36 @@ def _heuristic_plan(input_text: str, relationship: dict[str, Any] | None = None)
         compat = float(relationship.get("compatibility_score", 0.0))
         turns = int(relationship.get("turns", 0))
         stage = str(relationship.get("stage", "strangers"))
-        # Negative momentum — she's pulling away
-        if momentum < -0.1:
+        # Strong negative momentum — she's clearly pulling away
+        if momentum < -0.22:
             use_human = True
-            human_reason = "Negative momentum: she's cooling off. Ask human for a fresh angle."
-        # Stagnant compatibility after a few turns
-        elif compat < 0.3 and turns > 2:
+            human_reason = "Strong negative momentum: ask human for a pattern-break."
+        # Stagnant compatibility after multiple turns
+        elif compat < 0.24 and turns >= 5:
             use_human = True
             human_reason = "Low compatibility after several turns. Human perspective needed."
-        # Periodic strategic check-in every 4 turns
-        elif turns > 0 and turns % 4 == 0:
+        # Periodic strategic check-in (less frequent)
+        elif turns >= 6 and turns % 6 == 0:
             use_human = True
             human_reason = f"Periodic check-in at turn {turns}. Get human read on the situation."
-        # Still strangers after 3+ turns — not progressing
-        elif stage == "strangers" and turns >= 3:
+        # Still strangers after many turns — not progressing
+        elif stage == "strangers" and turns >= 6:
             use_human = True
             human_reason = "Still strangers after multiple turns. Need human creativity to break through."
-    # Input-based triggers: she sounds cold, dismissive, or bored
+    # Input-based triggers: explicit cold/dismissive phrasing only (avoid over-triggering)
     cold_patterns = [
-        "whatever", "don't care", "leave me alone", "go away", "not interested",
-        "stop", "boring", "ugh", "no", "nope", "k", "ok", "sure",
-        "i don't care", "why are you", "who asked",
+        "whatever",
+        "don't care",
+        "leave me alone",
+        "go away",
+        "not interested",
+        "stop texting me",
+        "you're annoying",
+        "this is boring",
+        "who asked",
+        "why are you still texting",
+        "i'm not talking to you",
+        "shut up",
     ]
     if any(p in t for p in cold_patterns) and not use_human:
         use_human = True
