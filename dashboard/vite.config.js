@@ -9,8 +9,21 @@ export default defineConfig({
       '/weave-api': {
         target: 'https://trace.wandb.ai',
         changeOrigin: true,
-        secure: false, // Troubleshooting 502: disable SSL verification temporarily
+        secure: true, // Use secure: true for production APIs
         rewrite: (path) => path.replace(/^\/weave-api/, ''),
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, _res) => {
+            console.log('[proxy error]', err);
+          });
+          proxy.on('proxyReq', (proxyReq, req, _res) => {
+            // Ensure the host header is set correctly for HTTPS targets
+            proxyReq.setHeader('host', 'trace.wandb.ai');
+            // console.log('[proxy req]', req.method, req.url);
+          });
+          proxy.on('proxyRes', (proxyRes, req, _res) => {
+            // console.log('[proxy res]', proxyRes.statusCode, req.url);
+          });
+        },
       }
     }
   }
