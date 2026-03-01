@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -97,6 +98,73 @@ def _extract_thinking(response: Any) -> list[str]:
     return list(dict.fromkeys(chunks))
 
 
+def _flatten_nodes(node: Any) -> list[Any]:
+    out: list[Any] = []
+
+    def walk(value: Any) -> None:
+        value = _as_dict(value)
+        if isinstance(value, dict):
+            out.append(value)
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(node)
+    return out
+
+
+def _extract_native_events(response: Any) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for node in _flatten_nodes(response):
+        event_type = node.get("type")
+        if not isinstance(event_type, str):
+            continue
+        if event_type.startswith("agent.") or event_type.startswith("tool.") or event_type.startswith("message."):
+            events.append(node)
+    return events
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for chunk in content:
+            data = _as_dict(chunk)
+            if isinstance(data, dict):
+                txt = data.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+                    continue
+                maybe = data.get("content")
+                if isinstance(maybe, str) and maybe.strip():
+                    parts.append(maybe.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _try_parse_json_block(text: str) -> dict[str, Any] | None:
+    t = text.strip()
+    if not t:
+        return None
+    try:
+        parsed = json.loads(t)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(t[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
 def _get_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -146,6 +214,30 @@ class FinalReply(BaseModel):
     memory_update_candidate: str = Field(description="Potential memory fact to store from this turn.")
 
 
+class MemoryHandoffOutput(BaseModel):
+    tool: str = Field(description="Tool identifier, always memory.")
+    recalled_facts: list[str] = Field(description="Relevant recalled facts from provided memory candidates.")
+    evidence: list[dict[str, Any]] = Field(description="Evidence rows linked to recalled facts.")
+    important_moment: str = Field(description="Most relevant recent moment.")
+    memory_confidence: float = Field(description="Confidence score in the recall quality.")
+    should_store_new_memory: bool = Field(description="Whether new memory should be persisted this turn.")
+
+
+class SeductionHandoffOutput(BaseModel):
+    tool: str = Field(description="Tool identifier, always seduction.")
+    friend_take: str = Field(description="What a trusted friend would bluntly advise in this exact moment.")
+    strategy: str = Field(description="High-level strategy for this response.")
+    recommended_lines: list[str] = Field(description="2-3 short line options.")
+    tone_guardrails: list[str] = Field(description="Safety and tone reminders.")
+
+
+class WebHandoffOutput(BaseModel):
+    tool: str = Field(description="Tool identifier, always web_search.")
+    summary: str = Field(description="Short factual summary for conversation use.")
+    key_points: list[str] = Field(description="Important factual points.")
+    sources: list[SourceItem] = Field(description="Citations used.")
+
+
 @dataclass
 class MistralCaller:
     api_key: str | None = None
@@ -153,6 +245,8 @@ class MistralCaller:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_calls: int = 0
+    use_native_handoff: bool = True
+    _native_handoff_agents: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         from mistralai import Mistral
@@ -205,6 +299,138 @@ class MistralCaller:
                 parsed = response.choices[0].message.parsed
                 thinking = _extract_thinking(response)
                 return parsed, thinking, usage
+            except Exception as exc:
+                if attempt == MAX_RETRIES:
+                    raise
+                time.sleep(_backoff_delay(attempt, _is_rate_limited(exc)))
+        raise RuntimeError("Unreachable retry loop exit.")
+
+    def _completion_args_json_schema(self, schema_name: str, schema_model: type[BaseModel]) -> dict[str, Any]:
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": schema_model.model_json_schema(),
+                },
+            }
+        }
+
+    def _ensure_native_agents(self, agent_type: Literal["girl", "man"]) -> dict[str, str]:
+        if agent_type in self._native_handoff_agents:
+            return self._native_handoff_agents[agent_type]
+
+        assert self.client is not None
+        if not hasattr(self.client, "beta"):
+            raise RuntimeError("Mistral beta agents API is unavailable in this SDK/client.")
+
+        persona = _persona(agent_type)
+        owner = persona["name"]
+        other = "MAN" if owner == "GIRL" else "GIRL"
+
+        memory_agent = self.client.beta.agents.create(
+            model="mistral-small-latest",
+            name=f"amour-{agent_type}-memory",
+            description="Selects relevant relationship memories from provided memory candidates.",
+            instructions=(
+                f"You are the memory specialist for {owner}. "
+                "Input is JSON and includes memory_candidates and recent_messages. "
+                "Never invent memory. Use only memory_candidates.evidence facts. "
+                "Return tool='memory'."
+            ),
+            completion_args=self._completion_args_json_schema("memory_handoff_output", MemoryHandoffOutput),
+        )
+
+        seduction_agent = self.client.beta.agents.create(
+            model="mistral-small-latest",
+            name=f"amour-{agent_type}-seduction",
+            description=(
+                "Acts like a trusted close friend who gives realistic, respectful texting advice "
+                "to improve attraction, trust, and emotional connection."
+            ),
+            instructions=(
+                f"You are {owner}'s trusted friend and dating advisor. "
+                "Give practical, human, realistic advice, not generic pickup lines. "
+                "Prioritize consent, emotional attunement, pacing, and authenticity. "
+                "Adapt to stage and mood: strangers=light/curious, bonded=increased vulnerability. "
+                "If hostility or disrespect is present, recommend boundaries over seduction. "
+                "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
+                "recommended_lines, and tone_guardrails."
+            ),
+            completion_args=self._completion_args_json_schema("seduction_handoff_output", SeductionHandoffOutput),
+        )
+
+        web_agent = self.client.beta.agents.create(
+            model="mistral-small-latest",
+            name=f"amour-{agent_type}-web",
+            description="Finds concise factual context for conversation when factual lookup is needed.",
+            instructions=(
+                "Use web_search when needed. Keep claims concise and cite sources. "
+                "Return tool='web_search'."
+            ),
+            tools=[{"type": "web_search"}],
+            completion_args=self._completion_args_json_schema("web_handoff_output", WebHandoffOutput),
+        )
+
+        primary_agent = self.client.beta.agents.create(
+            model="magistral-small-latest",
+            name=f"amour-{agent_type}-primary",
+            description=(
+                f"Primary romantic dialogue agent for {owner}. "
+                f"Speaks to {other}, optionally handing off to memory/seduction/web specialists."
+            ),
+            instructions=(
+                f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
+                "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
+                "hostile_input, memory_candidates, and handoff_hints. "
+                "Decide autonomously whether to handoff to memory, seduction, and/or web specialists. "
+                "Treat the seduction specialist as your trusted friend giving private coaching before you reply. "
+                "Respect handoff_hints: if consult_seduction/memory/web_search is true, you should handoff unless clearly unnecessary. "
+                "If hostile_input is true, do not flirt; set calm boundaries. "
+                "Never claim detailed memories unless they appear in memory specialist output. "
+                "Return only the final JSON reply."
+            ),
+            completion_args=self._completion_args_json_schema("final_reply", FinalReply),
+        )
+
+        primary_agent = self.client.beta.agents.update(
+            agent_id=primary_agent.id,
+            handoffs=[memory_agent.id, seduction_agent.id, web_agent.id],
+        )
+
+        agents = {
+            "primary": primary_agent.id,
+            "memory": memory_agent.id,
+            "seduction": seduction_agent.id,
+            "web_search": web_agent.id,
+        }
+        self._native_handoff_agents[agent_type] = agents
+        return agents
+
+    def call_native_handoff(
+        self,
+        *,
+        agent_type: Literal["girl", "man"],
+        payload: dict[str, Any],
+    ) -> tuple[Any, list[str], dict[str, int], list[dict[str, Any]]]:
+        assert self.client is not None
+        agents = self._ensure_native_agents(agent_type)
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                self._throttle()
+                response = self.client.beta.conversations.start(
+                    agent_id=agents["primary"],
+                    inputs=json.dumps(payload, ensure_ascii=True),
+                    handoff_execution="server",
+                    store=False,
+                )
+                usage = _get_usage(response)
+                self.total_prompt_tokens += usage["prompt_tokens"]
+                self.total_completion_tokens += usage["completion_tokens"]
+                self.total_calls += 1
+                thinking = _extract_thinking(response)
+                events = _extract_native_events(response)
+                return response, thinking, usage, events
             except Exception as exc:
                 if attempt == MAX_RETRIES:
                     raise
@@ -460,6 +686,16 @@ class MemoryStore:
             "memory_confidence": confidence,
         }
 
+    def snapshot(self, session_id: str, owner: str, *, fact_limit: int = 40, message_limit: int = 12) -> dict[str, Any]:
+        data = self._load()
+        bucket = self._agent_bucket(data, session_id, owner)
+        facts = self._normalize_facts(bucket.get("facts", []))
+        messages = bucket.get("messages", [])
+        return {
+            "evidence": facts[-fact_limit:],
+            "recent_messages": messages[-message_limit:],
+        }
+
 
 def _persona(agent_type: Literal["girl", "man"]) -> dict[str, str]:
     if agent_type == "girl":
@@ -519,6 +755,51 @@ def _extract_fact_candidate(text: str) -> str:
     return ""
 
 
+def _memory_cue_strength(text: str) -> tuple[bool, bool]:
+    t = text.lower()
+    strong_patterns = [
+        r"\bdo you remember\b",
+        r"\bremember when\b",
+        r"\byou said\b",
+        r"\blast time\b",
+        r"\bwe talked about\b",
+    ]
+    weak_patterns = [
+        r"\bfavorite\b",
+        r"\bdream trip\b",
+        r"\bagain\b",
+        r"\bstill\b",
+    ]
+    strong = any(re.search(p, t) for p in strong_patterns)
+    weak = any(re.search(p, t) for p in weak_patterns)
+    return strong, weak
+
+
+def _should_call_memory(input_text: str, planner_wants_memory: bool) -> tuple[bool, str]:
+    strong, weak = _memory_cue_strength(input_text)
+    if not planner_wants_memory:
+        return False, "Planner did not request memory."
+    if strong:
+        return True, "Strong explicit memory cue detected."
+    if weak:
+        return False, "Weak cue only; strict memory gating skipped recall."
+    return False, "No explicit memory cue; strict memory gating skipped recall."
+
+
+def _forget_roll(
+    *,
+    session_id: str,
+    agent_type: str,
+    input_text: str,
+    base_forget_prob: float,
+) -> bool:
+    # Deterministic pseudo-random roll for reproducible runs.
+    seed = f"{session_id}|{agent_type}|{input_text}".encode("utf-8")
+    digest = hashlib.md5(seed).hexdigest()
+    roll = int(digest[:8], 16) / 0xFFFFFFFF
+    return roll < base_forget_prob
+
+
 def _search_wikipedia(query: str, max_results: int = 2) -> WebSearchResult | None:
     q = quote(query)
     search_url = (
@@ -565,10 +846,22 @@ def _build_plan_system(agent_type: Literal["girl", "man"]) -> str:
     )
 
 
-def _build_seduction_system(agent_type: Literal["girl", "man"]) -> str:
+def _mood_instruction(agent_type: Literal["girl", "man"], mood_profile: str) -> str:
+    if agent_type == "girl" and mood_profile == "rejection":
+        return (
+            "Current mood profile: rejection. "
+            "Be polite but guarded, slower to trust, and avoid immediate affection."
+        )
+    if mood_profile == "open":
+        return "Current mood profile: open. Be warm and engaged while staying respectful."
+    return "Current mood profile: neutral."
+
+
+def _build_seduction_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
     p = _persona(agent_type)
     return (
         f"You are a seduction coach for {p['name']}. "
+        f"{_mood_instruction(agent_type, mood_profile)} "
         "Return advice that is respectful, consensual, emotionally intelligent, and concise. "
         "Never produce manipulative or coercive guidance."
     )
@@ -581,15 +874,103 @@ def _build_web_fallback_system() -> str:
     )
 
 
-def _build_reply_system(agent_type: Literal["girl", "man"]) -> str:
+def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = "neutral") -> str:
     p = _persona(agent_type)
     return (
         f"You are {p['name']}. "
         f"Style: {p['style']}. Goal: {p['goal']}. "
+        f"{_mood_instruction(agent_type, mood_profile)} "
         "Write one natural reply to the lover's latest message. "
         "Use tool outputs if provided. Do not mention tools. Keep reply under 90 words. "
         "Critical memory rule: only reference specific past details if they appear in memory.recalled_facts. "
         "If memory.recalled_facts is empty, do not claim to remember specifics; be honest and ask for details."
+    )
+
+
+def _should_call_seduction(
+    *,
+    input_text: str,
+    planner_wants_seduction: bool,
+    relationship_stage: str,
+    mood_profile: str = "neutral",
+) -> tuple[bool, str]:
+    if not planner_wants_seduction:
+        return False, "Planner did not request seduction."
+
+    t = input_text.lower()
+    explicit_flirt = any(
+        k in t
+        for k in [
+            "kiss",
+            "date",
+            "my dear",
+            "my love",
+            "beautiful",
+            "handsome",
+            "flirt",
+        ]
+    )
+    emotional_support = any(k in t for k in ["sad", "upset", "rough day", "stressed", "lonely", "nervous"])
+
+    if relationship_stage in {"flirty", "bonded", "in_love"}:
+        return True, f"Relationship stage '{relationship_stage}' allows romantic coaching."
+    if mood_profile == "rejection":
+        if explicit_flirt and relationship_stage in {"curious", "flirty", "bonded", "in_love"}:
+            return True, "Rejection mode: explicit flirt accepted after initial rapport."
+        if emotional_support:
+            return True, "Rejection mode: emotional support allowed."
+        return False, "Rejection mode: hold romantic coaching until trust builds."
+    if relationship_stage == "curious":
+        if explicit_flirt:
+            return True, "Explicit flirt cue detected."
+        return True, "Curious stage allows light romantic coaching."
+    # strangers
+    if explicit_flirt:
+        return True, "Explicit flirt cue detected."
+    if emotional_support:
+        return True, "Support cue detected; use gentle seduction coach tone."
+    return False, "Stranger stage without flirt/support cue; skip seduction."
+
+
+def _build_reply_system_with_stage(
+    agent_type: Literal["girl", "man"], relationship_stage: str, mood_profile: str = "neutral"
+) -> str:
+    base = _build_reply_system(agent_type, mood_profile=mood_profile)
+    if relationship_stage in {"strangers", "curious"}:
+        return (
+            base
+            + " Early-stage rule: keep tone warm, curious, and respectful. "
+            + "Avoid strong commitment/projection claims (e.g., destiny, forever, 'you make me feel X already')."
+        )
+    return base
+
+
+def _detect_hostility(text: str) -> tuple[bool, str]:
+    t = text.lower()
+    hostile_patterns = [
+        r"\bshut up\b",
+        r"\bfuck you\b",
+        r"\bbitch\b",
+        r"\bta gueule\b",
+        r"\bferme ta gueule\b",
+        r"\bconnard\b",
+        r"\bconne\b",
+        r"\bpute\b",
+        r"\bsalope\b",
+    ]
+    for p in hostile_patterns:
+        if re.search(p, t):
+            return True, f"Hostile phrase detected: {p}"
+    return False, "No explicit hostility detected."
+
+
+def _build_boundary_reply_system(agent_type: Literal["girl", "man"]) -> str:
+    p = _persona(agent_type)
+    return (
+        f"You are {p['name']}. "
+        "The incoming message is disrespectful or hostile. "
+        "Respond with calm boundaries: short, firm, non-abusive. "
+        "Do not flirt. Do not escalate. Invite respectful conversation or stop."
     )
 
 
@@ -612,6 +993,218 @@ def _sanitize_reply_for_memory(reply: str, memory_output: dict[str, Any]) -> str
     return reply
 
 
+def _extract_message_payload(event: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = event.get("parsed")
+    parsed = _as_dict(parsed)
+    if isinstance(parsed, dict):
+        return parsed
+    text = _content_to_text(event.get("content"))
+    return _try_parse_json_block(text)
+
+
+def run_turn_native(
+    *,
+    caller: MistralCaller,
+    memory_store: MemoryStore,
+    agent_type: Literal["girl", "man"],
+    input_text: str,
+    session_id: str,
+    mood_profile: str = "neutral",
+) -> dict[str, Any]:
+    stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    relationship_stage = str(stage_state.get("stage", "strangers"))
+    hostile_input, hostility_reason = _detect_hostility(input_text)
+    memory_candidates = memory_store.snapshot(session_id=session_id, owner=agent_type, fact_limit=40, message_limit=12)
+    heuristic = _heuristic_plan(input_text)
+    use_memory_hint, memory_hint_reason = _should_call_memory(input_text, heuristic.use_memory)
+    use_seduction_hint, seduction_hint_reason = _should_call_seduction(
+        input_text=input_text,
+        planner_wants_seduction=heuristic.use_seduction,
+        relationship_stage=relationship_stage,
+        mood_profile=mood_profile,
+    )
+    use_web_hint = heuristic.use_web_search
+    web_hint_reason = heuristic.web_search_reason
+
+    payload = {
+        "input_text": input_text,
+        "session_id": session_id,
+        "agent_type": agent_type,
+        "mood_profile": mood_profile,
+        "relationship_stage": relationship_stage,
+        "hostile_input": hostile_input,
+        "hostility_reason": hostility_reason,
+        "memory_candidates": memory_candidates,
+        "handoff_hints": {
+            "consult_memory": use_memory_hint,
+            "memory_reason": memory_hint_reason,
+            "consult_seduction": use_seduction_hint,
+            "seduction_reason": seduction_hint_reason,
+            "consult_web_search": use_web_hint,
+            "web_search_reason": web_hint_reason,
+            "web_query": heuristic.web_query if use_web_hint else "n/a",
+        },
+    }
+
+    response, thinking, usage, events = caller.call_native_handoff(agent_type=agent_type, payload=payload)
+    _ = response  # Keep for future debugging, events already extracted.
+
+    tool_outputs: dict[str, Any] = {}
+    called_tools: set[str] = set()
+    for event in events:
+        if event.get("type") == "tool.execution":
+            name = event.get("name")
+            if isinstance(name, str):
+                called_tools.add(name)
+        if event.get("type") != "message.output":
+            continue
+        parsed = _extract_message_payload(event)
+        if not isinstance(parsed, dict):
+            continue
+        tool = parsed.get("tool")
+        if tool == "memory":
+            mem = MemoryHandoffOutput.model_validate(parsed)
+            tool_outputs["memory"] = {
+                "recalled_facts": mem.recalled_facts,
+                "evidence": mem.evidence,
+                "important_moment": mem.important_moment,
+                "memory_confidence": mem.memory_confidence,
+                "should_store_new_memory": mem.should_store_new_memory,
+            }
+            called_tools.add("memory")
+        elif tool == "seduction":
+            sed = SeductionHandoffOutput.model_validate(parsed)
+            tool_outputs["seduction"] = {
+                "friend_take": sed.friend_take,
+                "strategy": sed.strategy,
+                "recommended_lines": sed.recommended_lines,
+                "tone_guardrails": sed.tone_guardrails,
+            }
+            called_tools.add("seduction")
+        elif tool == "web_search":
+            web = WebHandoffOutput.model_validate(parsed)
+            tool_outputs["web_search"] = {
+                "summary": web.summary,
+                "key_points": web.key_points,
+                "sources": [s.model_dump() for s in web.sources],
+            }
+            called_tools.add("web_search")
+
+    final_reply: FinalReply | None = None
+    for event in reversed(events):
+        if event.get("type") != "message.output":
+            continue
+        parsed = _extract_message_payload(event)
+        if not isinstance(parsed, dict):
+            continue
+        if {"reply", "short_rationale", "memory_update_candidate"} <= set(parsed.keys()):
+            final_reply = FinalReply.model_validate(parsed)
+            break
+        text = _content_to_text(event.get("content"))
+        if text and final_reply is None:
+            final_reply = FinalReply(
+                reply=text[:500],
+                short_rationale="Native handoff fallback parsed from assistant text.",
+                memory_update_candidate="",
+            )
+            break
+
+    if final_reply is None:
+        raise RuntimeError("Native handoff returned no parsable final reply.")
+
+    plan = ToolPlan(
+        use_memory="memory" in called_tools,
+        memory_reason="Native handoff selected memory specialist." if "memory" in called_tools else "Native handoff skipped memory specialist.",
+        use_seduction="seduction" in called_tools,
+        seduction_reason=(
+            "Native handoff selected seduction specialist."
+            if "seduction" in called_tools
+            else "Native handoff skipped seduction specialist."
+        ),
+        use_web_search="web_search" in called_tools,
+        web_search_reason=(
+            "Native handoff selected web_search specialist."
+            if "web_search" in called_tools
+            else "Native handoff skipped web_search specialist."
+        ),
+        web_query=input_text if "web_search" in called_tools else "n/a",
+        response_goal="Respond naturally while managing specialist handoffs.",
+    )
+
+    memory_called = "memory" in called_tools
+    tool_calls = [
+        {"tool": "memory", "called": memory_called, "reason": plan.memory_reason},
+        {"tool": "web_search", "called": "web_search" in called_tools, "reason": plan.web_search_reason},
+        {"tool": "seduction", "called": "seduction" in called_tools, "reason": plan.seduction_reason},
+    ]
+
+    trace: dict[str, Any] = {
+        "planning": ["Native Mistral handoff orchestration used."],
+        "tool_reasons": [plan.memory_reason, plan.web_search_reason, plan.seduction_reason],
+        "model_thinking": {
+            "planner": thinking,
+            "final_reply": [],
+            "seduction": [],
+            "web_fallback": [],
+        },
+        "fallbacks": [],
+        "native_handoff_events": events,
+    }
+
+    other_speaker = "man" if agent_type == "girl" else "girl"
+    memory_store.append_message(
+        session_id=session_id,
+        owner=agent_type,
+        speaker=other_speaker,
+        text=input_text,
+    )
+    fact_candidate = _extract_fact_candidate(input_text)
+    if fact_candidate:
+        memory_store.append_fact(
+            session_id=session_id,
+            owner=agent_type,
+            fact=fact_candidate,
+            source_text=input_text,
+            speaker=other_speaker,
+            confidence=0.75,
+            verified=False,
+        )
+
+    safe_reply = _sanitize_reply_for_memory(final_reply.reply, tool_outputs.get("memory", {}))
+    relationship = memory_store.update_relationship_state(
+        session_id=session_id,
+        owner=agent_type,
+        input_text=input_text,
+        response_text=safe_reply,
+        memory_used=memory_called,
+        seduction_used="seduction" in called_tools,
+        web_used="web_search" in called_tools,
+    )
+
+    return {
+        "ts": _utc_now(),
+        "session_id": session_id,
+        "agent_type": agent_type,
+        "mood_profile": mood_profile,
+        "input_text": input_text,
+        "plan": plan.model_dump(),
+        "tool_calls": tool_calls,
+        "tool_outputs": tool_outputs,
+        "reasoning_traces": trace,
+        "response": safe_reply,
+        "response_rationale": final_reply.short_rationale,
+        "relationship": relationship,
+        "usage": {
+            "by_step": {"native_handoff": usage},
+            "totals": {
+                "total_calls": caller.total_calls,
+                "total_prompt_tokens": caller.total_prompt_tokens,
+                "total_completion_tokens": caller.total_completion_tokens,
+            },
+        },
+    }
+
+
 def run_turn(
     *,
     caller: MistralCaller,
@@ -619,51 +1212,98 @@ def run_turn(
     agent_type: Literal["girl", "man"],
     input_text: str,
     session_id: str,
+    mood_profile: str = "neutral",
 ) -> dict[str, Any]:
+    trace_native_fallback = ""
+    if caller.use_native_handoff:
+        try:
+            return run_turn_native(
+                caller=caller,
+                memory_store=memory_store,
+                agent_type=agent_type,
+                input_text=input_text,
+                session_id=session_id,
+                mood_profile=mood_profile,
+            )
+        except Exception as native_exc:
+            trace_native_fallback = f"native_handoff_error={type(native_exc).__name__}"
+
     trace: dict[str, Any] = {
         "planning": [],
         "tool_reasons": [],
         "model_thinking": {"planner": [], "final_reply": [], "seduction": [], "web_fallback": []},
-        "fallbacks": [],
+        "fallbacks": [trace_native_fallback] if trace_native_fallback else [],
     }
     tool_outputs: dict[str, Any] = {}
     tool_calls: list[dict[str, Any]] = []
     usage_by_step: dict[str, dict[str, int]] = {}
+    memory_called = False
+    stage_state = memory_store.get_relationship_state(session_id=session_id, owner=agent_type)
+    relationship_stage = str(stage_state.get("stage", "strangers"))
+    hostile_input, hostility_reason = _detect_hostility(input_text)
 
     plan: ToolPlan
     try:
         planned, thinking, usage = caller.call_parse(
             model="magistral-small-latest",
             system=_build_plan_system(agent_type),
-            payload={"input_text": input_text, "session_id": session_id},
+            payload={
+                "input_text": input_text,
+                "session_id": session_id,
+                "relationship_stage": relationship_stage,
+            },
             schema=ToolPlan,
             temperature=0.0,
         )
         plan = planned
+        if hostile_input:
+            plan.use_seduction = False
+            plan.response_goal = "Set a calm boundary and request respectful language."
+            plan.seduction_reason = f"Blocked by safety: {hostility_reason}"
         trace["model_thinking"]["planner"] = thinking
         trace["planning"].append("Planner model decision used.")
         usage_by_step["planner"] = usage
     except Exception as exc:
         plan = _heuristic_plan(input_text)
+        if hostile_input:
+            plan.use_seduction = False
+            plan.response_goal = "Set a calm boundary and request respectful language."
+            plan.seduction_reason = f"Blocked by safety: {hostility_reason}"
         trace["planning"].append("Heuristic plan used due to planner failure.")
         trace["fallbacks"].append(f"planner_error={type(exc).__name__}")
 
     for _ in range(MAX_TOOL_ROUNDS):
-        if plan.use_memory:
+        use_memory_now, memory_gate_reason = _should_call_memory(input_text, plan.use_memory)
+        if use_memory_now:
             mem = memory_store.recall(session_id=session_id, owner=agent_type, query=input_text, limit=3)
+            if mem.get("recalled_facts"):
+                strong, _ = _memory_cue_strength(input_text)
+                forget_prob = 0.03 if strong else 0.1
+                if _forget_roll(
+                    session_id=session_id,
+                    agent_type=agent_type,
+                    input_text=input_text,
+                    base_forget_prob=forget_prob,
+                ):
+                    mem["recalled_facts"] = []
+                    mem["evidence"] = []
+                    mem["memory_confidence"] = 0.0
+                    mem["forgotten_this_turn"] = True
+                    memory_gate_reason = f"{memory_gate_reason} Natural forget triggered."
             fact_candidate = _extract_fact_candidate(input_text)
             should_store = bool(fact_candidate)
             mem["should_store_new_memory"] = should_store
             tool_outputs["memory"] = mem
+            memory_called = True
             tool_calls.append(
                 {
                     "tool": "memory",
                     "called": True,
-                    "reason": plan.memory_reason,
+                    "reason": memory_gate_reason,
                     "memory_hits": len(mem.get("recalled_facts", [])),
                 }
             )
-            trace["tool_reasons"].append(plan.memory_reason)
+            trace["tool_reasons"].append(memory_gate_reason)
 
         if plan.use_web_search:
             web_res = _search_wikipedia(plan.web_query.strip() or input_text)
@@ -715,16 +1355,22 @@ def run_turn(
                     )
             trace["tool_reasons"].append(plan.web_search_reason)
 
-        if plan.use_seduction:
+        use_seduction_now, seduction_gate_reason = _should_call_seduction(
+            input_text=input_text,
+            planner_wants_seduction=plan.use_seduction,
+            relationship_stage=relationship_stage,
+            mood_profile=mood_profile,
+        )
+        if use_seduction_now:
             try:
                 seduction, thinking, usage = caller.call_parse(
                     model="mistral-small-latest",
-                    system=_build_seduction_system(agent_type),
+                    system=_build_seduction_system(agent_type, mood_profile=mood_profile),
                     payload={
                         "input_text": input_text,
                         "memory": tool_outputs.get("memory", {}),
                         "web_context": tool_outputs.get("web_search", {}),
-                        "relationship_stage": "flirty",
+                        "relationship_stage": relationship_stage,
                     },
                     schema=SeductionAdvice,
                     temperature=0.2,
@@ -736,7 +1382,7 @@ def run_turn(
                     {
                         "tool": "seduction",
                         "called": True,
-                        "reason": plan.seduction_reason,
+                        "reason": seduction_gate_reason,
                         "status": "ok",
                     }
                 )
@@ -754,24 +1400,35 @@ def run_turn(
                     {
                         "tool": "seduction",
                         "called": True,
-                        "reason": plan.seduction_reason,
+                        "reason": seduction_gate_reason,
                         "status": "fallback",
                     }
                 )
-            trace["tool_reasons"].append(plan.seduction_reason)
+            trace["tool_reasons"].append(seduction_gate_reason)
 
-    if not plan.use_memory:
-        tool_calls.append({"tool": "memory", "called": False, "reason": plan.memory_reason})
+    if not memory_called:
+        _, memory_gate_reason = _should_call_memory(input_text, plan.use_memory)
+        tool_calls.append({"tool": "memory", "called": False, "reason": memory_gate_reason})
     if not plan.use_web_search:
         tool_calls.append({"tool": "web_search", "called": False, "reason": plan.web_search_reason})
-    if not plan.use_seduction:
-        tool_calls.append({"tool": "seduction", "called": False, "reason": plan.seduction_reason})
+    if not any(c["tool"] == "seduction" and c.get("called") for c in tool_calls):
+        _, seduction_gate_reason = _should_call_seduction(
+            input_text=input_text,
+            planner_wants_seduction=plan.use_seduction,
+            relationship_stage=relationship_stage,
+            mood_profile=mood_profile,
+        )
+        tool_calls.append({"tool": "seduction", "called": False, "reason": seduction_gate_reason})
 
     final: FinalReply
     try:
         final, thinking, usage = caller.call_parse(
             model="magistral-small-latest",
-            system=_build_reply_system(agent_type),
+            system=(
+                _build_boundary_reply_system(agent_type)
+                if hostile_input
+                else _build_reply_system_with_stage(agent_type, relationship_stage, mood_profile=mood_profile)
+            ),
             payload={
                 "input_text": input_text,
                 "plan": plan.model_dump(),
@@ -816,8 +1473,8 @@ def run_turn(
         owner=agent_type,
         input_text=input_text,
         response_text=safe_reply,
-        memory_used=plan.use_memory,
-        seduction_used=plan.use_seduction,
+        memory_used=memory_called,
+        seduction_used=any(c["tool"] == "seduction" and c.get("called") for c in tool_calls),
         web_used=plan.use_web_search,
     )
 
@@ -825,6 +1482,7 @@ def run_turn(
         "ts": _utc_now(),
         "session_id": session_id,
         "agent_type": agent_type,
+        "mood_profile": mood_profile,
         "input_text": input_text,
         "plan": plan.model_dump(),
         "tool_calls": tool_calls,
@@ -895,6 +1553,11 @@ def _sentiment_score(text: str) -> float:
         "stressed",
         "sorry",
         "afraid",
+        "merde",
+        "putain",
+        "gueule",
+        "ferme",
+        "crier",
     }
     tokens = re.findall(r"[a-zA-Z']+", text.lower())
     if not tokens:
