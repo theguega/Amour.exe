@@ -72,10 +72,36 @@ async def wait_for_spacebar(prompt: str = "[press SPACE to start talking]") -> N
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+async def _watch_stop_key(stop_event: asyncio.Event, key: str = "b") -> None:
+    """Listen for a key press in raw terminal mode and set stop_event when pressed."""
+    import sys
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    loop = asyncio.get_running_loop()
+    try:
+        tty.setraw(fd)
+        while not stop_event.is_set():
+            ch = await loop.run_in_executor(None, sys.stdin.read, 1)
+            if ch.lower() == key:
+                stop_event.set()
+                break
+            if ch in ("\x03", "\x1b"):
+                stop_event.set()
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def _fallback_prompt(agent_type: str) -> str:
+    """Return what the OTHER person says to open the conversation."""
     if agent_type == "girl":
-        return "Hey... I am here with you. Tell me one thing about your day."
-    return "Hi, I am listening. What are you feeling right now?"
+        # Girl receives an opener from the guy
+        return "Hey."
+    # Guy receives a cold opener from the girl — he has to work for it
+    return "Hi."
 
 
 def _print_turn(prefix: str, result: dict) -> None:
@@ -199,62 +225,125 @@ async def run_voice_loop(args) -> None:
     incoming = args.seed_text.strip() if args.seed_text else _fallback_prompt(args.type)
     turn_idx = 0
 
+    stt_silence = args.auto_silence_timeout_s if args.auto else args.silence_timeout_s
+    print(f"[config] auto={args.auto} silence_timeout={stt_silence}s auto_delay={args.auto_delay}s")
+
     if args.listen_first and not args.seed_text.strip():
-        await wait_for_spacebar("[press SPACE to start your first message]")
-        print("[stt] listen-first enabled: waiting for your input...")
+        if not args.auto:
+            await wait_for_spacebar("[press SPACE to start your first message]")
+        print("[stt] listen-first enabled: waiting for your input... (press B to stop)")
         from voice_interaction.realtime_tts import listen_and_transcribe
 
-        heard = await listen_and_transcribe(
-            silence_timeout_s=args.silence_timeout_s,
-            noise_calibration_s=args.noise_calibration_s,
-            speech_ratio=args.speech_ratio,
-        )
+        stop_event = asyncio.Event()
+        key_task = asyncio.create_task(_watch_stop_key(stop_event))
+        try:
+            heard = await listen_and_transcribe(
+                silence_timeout_s=stt_silence,
+                noise_calibration_s=args.noise_calibration_s,
+                speech_ratio=args.speech_ratio,
+                stop_event=stop_event,
+            )
+        finally:
+            stop_event.set()
+            key_task.cancel()
+            try:
+                await key_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
         incoming = heard.strip() or _fallback_prompt("man" if args.type == "girl" else "girl")
 
     while args.max_turns <= 0 or turn_idx < args.max_turns:
         turn_idx += 1
+        t_loop_top = time.perf_counter()
         print(f"\n[turn {turn_idx}] input -> {incoming}")
 
         await broadcast({"action": "typing"})
         t_turn = time.perf_counter()
-        result = await asyncio.to_thread(
-            run_turn,
-            caller=caller,
-            memory_store=memory_store,
-            agent_type=args.type,
-            input_text=incoming,
-            session_id=args.session_id,
-            mood_profile=_mood_for(args.type, args),
-        )
-        await broadcast({"action": "stop_typing"})
+        print(f"[turn {turn_idx}] calling run_turn...")
+        try:
+            result = await asyncio.to_thread(
+                run_turn,
+                caller=caller,
+                memory_store=memory_store,
+                agent_type=args.type,
+                input_text=incoming,
+                session_id=args.session_id,
+                mood_profile=_mood_for(args.type, args),
+            )
+        except Exception as exc:
+            print(f"[turn {turn_idx}] run_turn CRASHED: {type(exc).__name__}: {exc}")
+            await broadcast({"action": "stop_typing"})
+            raise
         turn_duration = time.perf_counter() - t_turn
+        print(f"[turn {turn_idx}] run_turn done in {turn_duration:.2f}s")
+        await broadcast({"action": "stop_typing"})
         log_to_weave_fn(result, turn_duration)
         _append_jsonl(Path(args.log_file), result)
 
         reply = result["response"]
+        rel = result.get("relationship", {})
+        print(f"[turn {turn_idx}] reply ({len(reply)} chars): {reply[:120]}...")
         await broadcast({"action": "speech", "text": reply})
+        await broadcast({
+            "action": "sentiment",
+            "compatibility": rel.get("compatibility_score", 0.2),
+            "stage": rel.get("stage", "strangers"),
+            "trend": rel.get("trend", "stable"),
+        })
         _print_turn("agent", result)
 
-        print("[tts] generating audio...")
-        audio_path = text_to_audio(reply, VOICE_IDS[args.type])
-        print(f"[tts] file={audio_path}")
+        t_tts = time.perf_counter()
+        print(f"[turn {turn_idx}] generating TTS audio...")
+        try:
+            audio_path = text_to_audio(reply, VOICE_IDS[args.type])
+        except Exception as exc:
+            print(f"[turn {turn_idx}] TTS CRASHED: {type(exc).__name__}: {exc}")
+            raise
+        print(f"[turn {turn_idx}] TTS done in {time.perf_counter() - t_tts:.2f}s -> {audio_path}")
+
+        t_play = time.perf_counter()
         await play_audio(audio_path)
+        print(f"[turn {turn_idx}] audio playback done in {time.perf_counter() - t_play:.2f}s")
 
-        # After speaking, wait a bit before hiding bubble, or hide it now?
-        # Maybe hide it after audio finishes?
-        await broadcast({"action": "stop_typing"})  # Ensure it's hidden after speaking
+        await broadcast({"action": "stop_typing"})
 
-        await wait_for_spacebar()
-        print("[stt] listening for the other agent/user...")
-        transcribed_text = await listen_and_transcribe(
-            silence_timeout_s=args.silence_timeout_s,
-            noise_calibration_s=args.noise_calibration_s,
-            speech_ratio=args.speech_ratio,
-        )
+        print(f"[turn {turn_idx}] total turn time: {time.perf_counter() - t_loop_top:.2f}s")
+
+        if args.auto:
+            print(f"[turn {turn_idx}] auto-waiting {args.auto_delay}s before listening...")
+            await asyncio.sleep(args.auto_delay)
+        else:
+            print(f"[turn {turn_idx}] waiting for spacebar...")
+            await wait_for_spacebar()
+
+        print(f"[turn {turn_idx}] starting STT... (press B to stop listening)")
+        t_stt = time.perf_counter()
+        stop_event = asyncio.Event()
+        key_task = asyncio.create_task(_watch_stop_key(stop_event))
+        try:
+            transcribed_text = await listen_and_transcribe(
+                silence_timeout_s=stt_silence,
+                noise_calibration_s=args.noise_calibration_s,
+                speech_ratio=args.speech_ratio,
+                stop_event=stop_event,
+            )
+        except Exception as exc:
+            print(f"[turn {turn_idx}] STT CRASHED: {type(exc).__name__}: {exc}")
+            raise
+        finally:
+            stop_event.set()
+            key_task.cancel()
+            try:
+                await key_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+        print(f"[turn {turn_idx}] STT done in {time.perf_counter() - t_stt:.2f}s")
         incoming = transcribed_text.strip()
         if not incoming:
             incoming = _fallback_prompt("man" if args.type == "girl" else "girl")
-            print("[stt] empty input detected, using fallback prompt.")
+            print(f"[turn {turn_idx}] empty STT input, using fallback: {incoming}")
+        else:
+            print(f"[turn {turn_idx}] heard: {incoming}")
 
 
 async def run_duplex_loop(args) -> None:
@@ -293,6 +382,14 @@ async def run_duplex_loop(args) -> None:
         _append_jsonl(Path(args.log_file), result)
         print(f"[duplex] turn={turn_idx} agent={current_agent} elapsed_ms={turn_ms}")
         _print_turn(current_agent, result)
+
+        rel = result.get("relationship", {})
+        await broadcast({
+            "action": "sentiment",
+            "compatibility": rel.get("compatibility_score", 0.2),
+            "stage": rel.get("stage", "strangers"),
+            "trend": rel.get("trend", "stable"),
+        })
 
         incoming = result["response"]
         current_agent = "man" if current_agent == "girl" else "girl"
@@ -412,9 +509,12 @@ def parse_args():
     parser.add_argument(
         "--listen-first", action="store_true", help="In voice mode, listen before first response."
     )
-    parser.add_argument("--silence-timeout-s", type=float, default=3.0)
+    parser.add_argument("--silence-timeout-s", type=float, default=5.0)
     parser.add_argument("--noise-calibration-s", type=float, default=1.0)
     parser.add_argument("--speech-ratio", type=float, default=2.5)
+    parser.add_argument("--auto", action="store_true", help="Auto-listen after TTS, no spacebar needed. For 2-computer setups.")
+    parser.add_argument("--auto-delay", type=float, default=2.5, help="Seconds to wait after TTS before listening (avoid echo).")
+    parser.add_argument("--auto-silence-timeout-s", type=float, default=8.0, help="Silence timeout when in auto mode (longer to avoid cutting off the other speaker).")
     return parser.parse_args()
 
 
@@ -430,12 +530,18 @@ def _open_html(filename: str):
         print(f"Warning: HTML file not found at {html_path}")
 
 
+def _html_for_agent(agent_type: str) -> str:
+    return "guy.html" if agent_type == "man" else "girl.html"
+
+
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.starter in ["man", "girl"]:
-        html_file = "guy.html" if args.starter == "man" else "girl.html"
-        _open_html(html_file)
+    if args.duplex:
+        _open_html("girl.html")
+        _open_html("guy.html")
+    else:
+        _open_html(_html_for_agent(args.type))
 
     if args.benchmark_runs > 0:
         if not args.duplex:

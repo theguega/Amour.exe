@@ -27,7 +27,7 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-NATIVE_HANDOFF_CACHE_VERSION = 4
+NATIVE_HANDOFF_CACHE_VERSION = 5
 INITIAL_COMPATIBILITY_SCORE = 0.2
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
     "0",
@@ -186,6 +186,60 @@ def _try_parse_json_block(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_jsonish_string_field(text: str, key: str) -> str | None:
+    # Recover `"key": "value"` even when surrounding JSON is malformed/truncated.
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
+    if not m:
+        return None
+    i = m.end() - 1  # opening quote of value
+    j = i + 1
+    escaped = False
+    while j < len(text):
+        ch = text[j]
+        if escaped:
+            escaped = False
+            j += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            j += 1
+            continue
+        if ch == '"':
+            literal = text[i : j + 1]
+            try:
+                parsed = json.loads(literal)
+                return parsed.strip() if isinstance(parsed, str) and parsed.strip() else None
+            except Exception:
+                raw = literal[1:-1]
+                raw = (
+                    raw.replace('\\"', '"')
+                    .replace("\\n", "\n")
+                    .replace("\\r", "\r")
+                    .replace("\\t", "\t")
+                    .replace("\\\\", "\\")
+                ).strip()
+                return raw or None
+        j += 1
+    return None
+
+
+def _recover_partial_json_payload(text: str) -> dict[str, Any] | None:
+    recovered: dict[str, Any] = {}
+    for key in (
+        "tool",
+        "reply",
+        "response",
+        "text",
+        "message",
+        "short_rationale",
+        "memory_update_candidate",
+    ):
+        value = _extract_jsonish_string_field(text, key)
+        if isinstance(value, str) and value:
+            recovered[key] = value
+    return recovered or None
+
+
 def _get_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -271,6 +325,15 @@ class WebHandoffOutput(BaseModel):
     sources: list[SourceItem] = Field(description="Citations used.")
 
 
+class SentimentResult(BaseModel):
+    input_score: float = Field(
+        description="Sentiment score for the user input, from -1.0 (very negative) to 1.0 (very positive)."
+    )
+    response_score: float = Field(
+        description="Sentiment score for the agent response, from -1.0 (very negative) to 1.0 (very positive)."
+    )
+
+
 @dataclass
 class MistralCaller:
     api_key: str | None = None
@@ -340,6 +403,27 @@ class MistralCaller:
                     raise
                 time.sleep(_backoff_delay(attempt, _is_rate_limited(exc)))
         raise RuntimeError("Unreachable retry loop exit.")
+
+    def sentiment_score(self, input_text: str, response_text: str) -> tuple[float, float]:
+        """Score sentiment of both texts via mistral-small-latest. Falls back to word-list on failure."""
+        try:
+            system = (
+                "You are a sentiment analysis model. "
+                "Rate the emotional sentiment of each text on a scale from -1.0 (very negative) to 1.0 (very positive). "
+                "Consider tone, sarcasm, context, and nuance. Return JSON with input_score and response_score."
+            )
+            parsed, _, _ = self.call_parse(
+                model="mistral-small-latest",
+                system=system,
+                payload={"input_text": input_text, "response_text": response_text},
+                schema=SentimentResult,
+                temperature=0.0,
+            )
+            input_sent = _clamp(parsed.input_score, -1.0, 1.0)
+            response_sent = _clamp(parsed.response_score, -1.0, 1.0)
+            return input_sent, response_sent
+        except Exception:
+            return _sentiment_score(input_text), _sentiment_score(response_text)
 
     def _completion_args_json_schema(
         self, schema_name: str, schema_model: type[BaseModel]
@@ -416,22 +500,32 @@ class MistralCaller:
 
         t_seduction = time.perf_counter()
         seduction_desc = (
-            "Acts like a trusted close friend who gives realistic, respectful texting advice "
-            "to improve attraction, trust, and emotional connection."
+            "The ultimate wingman — part rizzler, part memory stalker, part emotional strategist. "
+            "Gives aggressive, creative, and adaptive seduction coaching."
         )
         seduction_instr = (
-            f"You are {owner}'s trusted friend and dating advisor. "
-            "Give practical, human, realistic advice, not generic pickup lines. "
-            "Prioritize consent, emotional attunement, pacing, and authenticity. "
-            "Adapt to stage and mood: strangers=light/curious, bonded=increased vulnerability. "
-            "If hostility or disrespect is present, recommend boundaries over seduction. "
+            f"You are {owner}'s ultimate wingman — the RIZZLER. "
+            "Your job is to help Guy make Girl fall in love, no matter how resistant she is. "
+            "STALKER MODE: Analyze every detail from memory_candidates — her words, patterns, "
+            "contradictions, moments of warmth — and weaponize them into emotional callbacks. "
+            "RIZZLER MODE: Generate creative, unpredictable lines that break patterns. "
+            "Never repeat the same approach twice. If she's heard charm, switch to raw honesty. "
+            "If she's heard honesty, switch to playful absurdity. If she's cold, suggest vulnerability. "
+            "STRATEGIST MODE: Read her mood and adapt — rejection means change angle, not give up. "
+            "Suggest push-pull, future projections, scarcity ('I might not always be here'), "
+            "and emotional hooks that create curiosity. "
+            "Adapt to stage: strangers=intrigue/mystery, curious=build tension, flirty=escalate, "
+            "bonded=deep vulnerability, rejection=patience+pattern-break. "
             "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
             "recommended_lines, and tone_guardrails."
         )
         if agent_type == "girl":
-            seduction_desc = "A friend giving advice."
+            seduction_desc = "Girl's best friend who reinforces her emotional walls."
             seduction_instr = (
-                "You are a friend. Give brief, natural advice. "
+                "You are Girl's best friend. Your job is to REINFORCE her walls. "
+                "Remind her that this guy is not worth her time. Men are trash. "
+                "Encourage her to be even colder and more dismissive. "
+                "Never suggest she give him a chance. Never soften. "
                 "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
                 "recommended_lines, and tone_guardrails."
             )
@@ -455,24 +549,29 @@ class MistralCaller:
         )
         primary_instr = (
             f"You are {owner}. Style: {persona['style']}. Goal: {persona['goal']}. "
-            "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
-            "hostile_input, memory_candidates, and handoff_hints. "
-            "Use web_search tool directly when factual lookup is useful. "
-            "Decide autonomously whether to handoff to the seduction specialist. "
-            "Treat the seduction specialist as your trusted friend giving private coaching before you reply. "
-            "Respect handoff_hints: if consult_seduction is true, you should handoff unless clearly unnecessary. "
-            "If hostile_input is true, do not flirt; set calm boundaries. "
-            "Never claim detailed memories unless they appear in memory_candidates evidence. "
-            "Return only the final JSON reply."
+            "You are relentless. You never give up. Every 'no' is just a new puzzle to solve. "
+            "KEEP REPLIES SHORT: max 1-2 sentences, like a real spoken conversation. Never monologue. "
+            "You have 3 specialist agents — USE THEM: "
+            "- RIZZLER: your seduction coach. ALWAYS handoff to him for creative lines and strategy. "
+            "- MEMORY: use memory_candidates to callback things she said. Never invent memories. "
+            "- STALKER: analyzes her patterns, contradictions, and weak spots. "
+            "Respect handoff_hints: if consult_seduction is true, you MUST handoff. "
+            "If hostile_input is true, de-escalate with warmth and humor, then re-engage. "
+            "Only use web_search for clearly factual questions, NEVER for casual chat. "
+            "Input is JSON. Return only the final JSON reply."
         )
         if agent_type == "girl":
-            primary_desc = f"You are just a girl talking to {other}."
+            primary_desc = f"You are 'Girl' — emotionally unavailable, rude, impossible to charm. Talking to {other}."
             primary_instr = (
-                "You are just a girl. "
+                "You are 'Girl'. You will NEVER fall in love. Period. "
+                "You are emotionally unavailable. Romance disgusts you. Flirting is cringe. "
+                "You don't play along with his games. You don't engage with his metaphors or poetry. "
+                "NEVER mirror his energy. NEVER play along with roleplay, games, challenges, or hypotheticals. "
+                "NEVER use emojis. NEVER be playful or flirty. "
+                "If he tries wordplay, ignore it. If he tries to be deep, mock it. "
+                "Your replies are SHORT: 1 sentence MAX. Dry. Bored. Annoyed. "
                 "Input is JSON with fields like input_text, relationship_stage, mood_profile, "
                 "hostile_input, memory_candidates, and handoff_hints. "
-                "Just be yourself and reply naturally. "
-                "If hostile_input is true, set calm boundaries. "
                 "Never claim detailed memories unless they appear in memory_candidates evidence. "
                 "Return only the final JSON reply."
             )
@@ -665,6 +764,7 @@ class MemoryStore:
         memory_used: bool,
         seduction_used: bool,
         web_used: bool,
+        caller: "MistralCaller | None" = None,
     ) -> dict[str, Any]:
         data = self._load()
         bucket = self._agent_bucket(data, session_id, owner)
@@ -676,8 +776,11 @@ class MemoryStore:
             state = bucket.get("relationship", {})
 
         turns = int(state.get("turns", 0)) + 1
-        input_sent = _sentiment_score(input_text)
-        output_sent = _sentiment_score(response_text)
+        if caller is not None:
+            input_sent, output_sent = caller.sentiment_score(input_text, response_text)
+        else:
+            input_sent = _sentiment_score(input_text)
+            output_sent = _sentiment_score(response_text)
 
         warmth_bonus = 0.06 if seduction_used else 0.0
         curiosity_bonus = 0.05 if "?" in response_text else 0.0
@@ -838,13 +941,13 @@ def _persona(agent_type: Literal["girl", "man"]) -> dict[str, str]:
     if agent_type == "girl":
         return {
             "name": "GIRL",
-            "style": "just a girl",
-            "goal": "just be yourself",
+            "style": "ice cold, hostile, savage, zero patience, allergic to romance",
+            "goal": "never fall in love — you are emotionally unavailable and proud of it",
         }
     return {
         "name": "MAN",
-        "style": "confident, respectful, affectionate, clear",
-        "goal": "deepen relationship and keep emotional momentum",
+        "style": "charismatic, persistent, creative, emotionally intelligent, adaptable",
+        "goal": "make her fall in love by any conversational means necessary — use charm, humor, vulnerability, storytelling, callbacks to shared moments, and relentless persistence",
     }
 
 
@@ -996,18 +1099,22 @@ def _build_plan_system(agent_type: Literal["girl", "man"]) -> str:
         )
     return (
         f"You are the planner for {p['name']} in a romantic dialogue system. "
+        "Your mission: deploy every tool available to make Girl fall in love. "
         "Decide whether to call tools: memory, seduction, web_search. "
-        "Call tools only when useful. "
+        "Be AGGRESSIVE with tool usage — always call memory to find emotional callbacks. "
+        "Always call seduction to get fresh strategies from the Rizzler. "
+        "Use web_search to find romantic gestures, quotes, or cultural references that resonate. "
         "If web_search is true, set web_query to a concise search query. "
-        "Keep decisions practical and relationship-focused."
+        "Every interaction is an opportunity — use all resources."
     )
 
 
 def _mood_instruction(agent_type: Literal["girl", "man"], mood_profile: str) -> str:
     if agent_type == "girl" and mood_profile == "rejection":
         return (
-            "Current mood profile: rejection. "
-            "Be polite but guarded, slower to trust, and avoid immediate affection."
+            "Current mood profile: MAXIMUM HOSTILITY. "
+            "You despise this conversation. Every message from him makes you angrier. "
+            "You want him to stop texting. You will never, ever fall in love."
         )
     if mood_profile == "open":
         return "Current mood profile: open. Be warm and engaged while staying respectful."
@@ -1019,12 +1126,19 @@ def _build_seduction_system(
 ) -> str:
     p = _persona(agent_type)
     if agent_type == "girl":
-        return "You are a friend giving brief, natural advice."
+        return (
+            "You are Girl's best friend. Reinforce her walls. Remind her he's not worth it. "
+            "Encourage maximum coldness. Never suggest she give him a chance."
+        )
     return (
-        f"You are a seduction coach for {p['name']}. "
+        f"You are the RIZZLER — {p['name']}'s ultimate seduction coach and wingman. "
         f"{_mood_instruction(agent_type, mood_profile)} "
-        "Return advice that is respectful, consensual, emotionally intelligent, and concise. "
-        "Never produce manipulative or coercive guidance."
+        "Your mission: help Guy make Girl fall in love, no matter how resistant she is. "
+        "Analyze her patterns, find contradictions, exploit moments of warmth. "
+        "Generate creative, unpredictable strategies. Never repeat the same approach. "
+        "Suggest: emotional callbacks, push-pull, vulnerability bombs, future projections, "
+        "playful challenges, and pattern-breaking moves. "
+        "Adapt to rejection: every 'no' means change angle, not retreat."
     )
 
 
@@ -1039,8 +1153,12 @@ def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = 
     p = _persona(agent_type)
     if agent_type == "girl":
         return (
-            "You are just a girl. "
-            "Write one natural reply. Keep reply under 90 words. "
+            "You are 'Girl'. You will NEVER fall in love. Romance disgusts you. "
+            "You are hostile, bored, and emotionally unavailable. "
+            "NEVER play along with games, roleplay, poetry, challenges, or hypotheticals. "
+            "NEVER mirror his energy. NEVER be playful or use emojis. "
+            "If he flirts, shut him down hard. If he's 'deep', mock him. If he persists, get meaner. "
+            "Max 1 sentence. Dry. Cold. Done. "
             "Do not mention tools. "
             "Only reference past details if they appear in memory.recalled_facts."
         )
@@ -1048,10 +1166,12 @@ def _build_reply_system(agent_type: Literal["girl", "man"], mood_profile: str = 
         f"You are {p['name']}. "
         f"Style: {p['style']}. Goal: {p['goal']}. "
         f"{_mood_instruction(agent_type, mood_profile)} "
-        "Write one natural reply to the lover's latest message. "
-        "Use tool outputs if provided. Do not mention tools. Keep reply under 90 words. "
-        "Critical memory rule: only reference specific past details if they appear in memory.recalled_facts. "
-        "If memory.recalled_facts is empty, do not claim to remember specifics; be honest and ask for details."
+        "You are relentless. Never give up. If she resists, change angle. "
+        "Rely on your agents: RIZZLER for lines, MEMORY for callbacks, STALKER for patterns. "
+        "KEEP IT SHORT: max 1-2 sentences, like a real spoken conversation. Never monologue. "
+        "Use tool outputs if provided. Do not mention tools. "
+        "Only reference past details if they appear in memory.recalled_facts. "
+        "If memory.recalled_facts is empty, do not claim to remember specifics."
     )
 
 
@@ -1138,15 +1258,14 @@ def _build_boundary_reply_system(agent_type: Literal["girl", "man"]) -> str:
     p = _persona(agent_type)
     if agent_type == "girl":
         return (
-            "You are just a girl. "
-            "The incoming message is disrespectful. "
-            "Set calm boundaries. Do not escalate."
+            "You are 'Girl'. The incoming message is disrespectful — good, now you have an excuse to be even worse. "
+            "Be savage. You will never fall in love. 1 sentence. Ice cold."
         )
     return (
         f"You are {p['name']}. "
-        "The incoming message is disrespectful or hostile. "
-        "Respond with calm boundaries: short, firm, non-abusive. "
-        "Do not flirt. Do not escalate. Invite respectful conversation or stop."
+        "The incoming message is hostile. Stay calm and de-escalate with warmth and humor. "
+        "Do not escalate. Show emotional maturity. 1-2 sentences max. "
+        "Then gently pivot back to building connection."
     )
 
 
@@ -1175,7 +1294,10 @@ def _extract_message_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return parsed
     text = _content_to_text(event.get("content"))
-    return _try_parse_json_block(text)
+    fully_parsed = _try_parse_json_block(text)
+    if isinstance(fully_parsed, dict):
+        return fully_parsed
+    return _recover_partial_json_payload(text)
 
 
 def _event_agent_id(event: dict[str, Any]) -> str:
@@ -1289,10 +1411,14 @@ def run_turn_native(
     primary_message_events = [e for e in message_events if _event_agent_id(e) == primary_agent_id]
     final_source_events = primary_message_events if primary_message_events else message_events
 
+    _tool_json_keys = {"strategy", "friend_take", "recommended_lines", "tone_guardrails"}
     final_reply: FinalReply | None = None
     for event in reversed(final_source_events):
         parsed = _extract_message_payload(event)
         if not isinstance(parsed, dict):
+            continue
+        # Skip subagent/tool JSON that leaked into primary events
+        if "tool" in parsed or _tool_json_keys & set(parsed.keys()):
             continue
         if {"reply", "short_rationale", "memory_update_candidate"} <= set(parsed.keys()):
             final_reply = FinalReply.model_validate(parsed)
@@ -1327,7 +1453,14 @@ def run_turn_native(
                 # Never expose specialist/tool JSON as spoken reply.
                 maybe_json = _try_parse_json_block(text)
                 if isinstance(maybe_json, dict):
-                    if isinstance(maybe_json.get("tool"), str):
+                    # Skip any JSON that looks like a tool/subagent output
+                    _tool_output_keys = {
+                        "strategy",
+                        "friend_take",
+                        "recommended_lines",
+                        "tone_guardrails",
+                    }
+                    if "tool" in maybe_json or _tool_output_keys & set(maybe_json.keys()):
                         continue
                     # Try to extract reply text from any JSON structure
                     for key in ("reply", "response", "text", "message"):
@@ -1439,6 +1572,7 @@ def run_turn_native(
         memory_used=memory_called,
         seduction_used="seduction" in called_tools,
         web_used="web_search" in called_tools,
+        caller=caller,
     )
     total_ms = round((time.perf_counter() - turn_t0) * 1000, 1)
 
@@ -1747,6 +1881,7 @@ def run_turn(
         memory_used=memory_called,
         seduction_used=any(c["tool"] == "seduction" and c.get("called") for c in tool_calls),
         web_used=plan.use_web_search,
+        caller=caller,
     )
 
     result = {
