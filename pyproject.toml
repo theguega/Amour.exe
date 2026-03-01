@@ -12,4 +12,5 @@ dependencies = [
     "pygame>=2.6.1",
     "python-dotenv>=1.2.1",
     "weave>=0.52.29",
+    "websockets>=16.0",
 ]
