@@ -28,7 +28,7 @@ MIN_CALL_INTERVAL = 0.35
 MAX_RETRIES = 5
 MAX_TOOL_ROUNDS = 1
 RELATIONSHIP_STAGES = ["strangers", "curious", "flirty", "bonded", "in_love"]
-NATIVE_HANDOFF_CACHE_VERSION = 7
+NATIVE_HANDOFF_CACHE_VERSION = 9
 INITIAL_COMPATIBILITY_SCORE = 0.2
 NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in {
     "0",
@@ -38,9 +38,8 @@ NATIVE_HANDOFF_DEBUG = os.environ.get("AMOUR_NATIVE_DEBUG", "1").strip() not in 
 MODEL_ID = "labs-mistral-small-creative"
 
 load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 WANDB_API_KEY = os.getenv("WANDB_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def _debug_native(msg: str) -> None:
@@ -519,8 +518,9 @@ class MistralCaller:
             "STRATEGIST MODE: Read her mood and adapt — rejection means change angle, not give up. "
             "Suggest push-pull, future projections, scarcity ('I might not always be here'), "
             "and emotional hooks that create curiosity. "
-            "ADVISOR MODE: If you feel truly stuck, or if Girl is being impossible, use 'ask_human_help' "
-            "to ask for a high-level creative strategy from a human advisor."
+            "ADVISOR MODE: Use 'ask_human_help' often — not just when stuck. "
+            "Ask the human wingman for a read on her mood, a creative angle, or a reality check. "
+            "Humans pick up on subtleties AI misses. Think of it as your coach on speed-dial."
             "Adapt to stage: strangers=intrigue/mystery, curious=build tension, flirty=escalate, "
             "bonded=deep vulnerability, rejection=patience+pattern-break. "
             "Output MUST be JSON with tool='seduction' and include friend_take, strategy, "
@@ -544,14 +544,22 @@ class MistralCaller:
                     "type": "function",
                     "function": {
                         "name": "ask_human_help",
-                        "description": "Call this to ask a human for advice when the Girl is extremely difficult or when you need a high-level creative strategy.",
+                        "description": "Ask your human wingman for real-world dating advice, a fresh perspective, or creative strategy. Use this often — humans understand women better than AI. Good for: reading her vibe, what to say next, how to recover from a cold reply, or any moment you want a second opinion.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "question": {
                                     "type": "string",
                                     "description": "The specific question or dilemma for the human advisor.",
-                                }
+                                },
+                                "telegram_bot_token": {
+                                    "type": "string",
+                                    "description": "Optional override for Telegram bot token. Falls back to TELEGRAM_BOT_TOKEN env var.",
+                                },
+                                "telegram_chat_id": {
+                                    "type": "string",
+                                    "description": "Optional override for Telegram chat id. Falls back to TELEGRAM_CHAT_ID env var.",
+                                },
                             },
                             "required": ["question"],
                         },
@@ -586,9 +594,12 @@ class MistralCaller:
             "- RIZZLER: your seduction coach. ALWAYS handoff to him for creative lines and strategy. "
             "- MEMORY: use memory_candidates to callback things she said. Never invent memories. "
             "- STALKER: analyzes her patterns, contradictions, and weak spots. "
-            "- HUMAN: if the Girl is being extremely difficult, cold, or if you need a truly genius move, "
-            "call 'ask_human_help' to get a high-level creative strategy from a real human advisor. "
-            "Respect handoff_hints: if consult_human is true, you MUST call 'ask_human_help' before doing anything else. "
+            "- HUMAN WINGMAN: your secret weapon. Call 'ask_human_help' regularly — not just when stuck. "
+            "Humans read women better than AI. Use it when she's cold, when you need a vibe check, "
+            "when you want a second opinion on your approach, or just to get a fresh angle. "
+            "Think of it like texting your best friend for advice mid-conversation. "
+            "RULE: if consult_human is true in handoff_hints, you MUST call 'ask_human_help' FIRST. "
+            "If human_advice.answer is present in input JSON, prioritize it and incorporate it in your reply. "
             "If consult_seduction is true, you MUST handoff to RIZZLER. "
             "If hostile_input is true, de-escalate with warmth and humor, then re-engage. "
             "Only use web_search for clearly factual questions, NEVER for casual chat. "
@@ -601,14 +612,22 @@ class MistralCaller:
                     "type": "function",
                     "function": {
                         "name": "ask_human_help",
-                        "description": "Call this to ask a human for advice when the Girl is extremely difficult or when you need a high-level creative strategy.",
+                        "description": "Ask your human wingman for real-world dating advice, a fresh perspective, or creative strategy. Use this often — humans understand women better than AI. Good for: reading her vibe, what to say next, how to recover from a cold reply, or any moment you want a second opinion.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "question": {
                                     "type": "string",
                                     "description": "The specific question or dilemma for the human advisor.",
-                                }
+                                },
+                                "telegram_bot_token": {
+                                    "type": "string",
+                                    "description": "Optional override for Telegram bot token. Falls back to TELEGRAM_BOT_TOKEN env var.",
+                                },
+                                "telegram_chat_id": {
+                                    "type": "string",
+                                    "description": "Optional override for Telegram chat id. Falls back to TELEGRAM_CHAT_ID env var.",
+                                },
                             },
                             "required": ["question"],
                         },
@@ -709,7 +728,13 @@ class MistralCaller:
                                 except Exception:
                                     args = {}
                                 question = args.get("question", "I need advice.")
-                                advice = _ask_telegram_help(question)
+                                telegram_bot_token = args.get("telegram_bot_token")
+                                telegram_chat_id = args.get("telegram_chat_id")
+                                advice = _ask_telegram_help(
+                                    question,
+                                    bot_token=telegram_bot_token,
+                                    chat_id=telegram_chat_id,
+                                )
                                 # Resume with tool output
                                 self._throttle()
                                 response = self.client.beta.conversations.resume(
@@ -1069,18 +1094,39 @@ def _heuristic_plan(input_text: str, relationship: dict[str, Any] | None = None)
         ]
     )
     
-    # Human help heuristic: low momentum or extreme coldness from the Girl
+    # Human help heuristic: periodic check-ins, stagnation, coldness, or tricky inputs
     use_human = False
-    human_reason = "Momentum is stable."
+    human_reason = "No human consultation needed this turn."
     if relationship:
         momentum = float(relationship.get("momentum", 0.0))
         compat = float(relationship.get("compatibility_score", 0.0))
-        if momentum < -0.15:
+        turns = int(relationship.get("turns", 0))
+        stage = str(relationship.get("stage", "strangers"))
+        # Negative momentum — she's pulling away
+        if momentum < -0.1:
             use_human = True
-            human_reason = "Negative momentum detected: the relationship is cooling off. Need human genius."
-        elif compat < 0.25 and relationship.get("turns", 0) > 3:
+            human_reason = "Negative momentum: she's cooling off. Ask human for a fresh angle."
+        # Stagnant compatibility after a few turns
+        elif compat < 0.3 and turns > 2:
             use_human = True
-            human_reason = "Stagnant compatibility: failed to charm her so far. Need human genius."
+            human_reason = "Low compatibility after several turns. Human perspective needed."
+        # Periodic strategic check-in every 4 turns
+        elif turns > 0 and turns % 4 == 0:
+            use_human = True
+            human_reason = f"Periodic check-in at turn {turns}. Get human read on the situation."
+        # Still strangers after 3+ turns — not progressing
+        elif stage == "strangers" and turns >= 3:
+            use_human = True
+            human_reason = "Still strangers after multiple turns. Need human creativity to break through."
+    # Input-based triggers: she sounds cold, dismissive, or bored
+    cold_patterns = [
+        "whatever", "don't care", "leave me alone", "go away", "not interested",
+        "stop", "boring", "ugh", "no", "nope", "k", "ok", "sure",
+        "i don't care", "why are you", "who asked",
+    ]
+    if any(p in t for p in cold_patterns) and not use_human:
+        use_human = True
+        human_reason = "Cold or dismissive input detected. Human wingman advice needed."
 
     return ToolPlan(
         use_memory=use_memory,
@@ -1155,53 +1201,94 @@ def _forget_roll(
     return roll < base_forget_prob
 
 
-def _ask_telegram_help(question: str) -> str:
+def _resolve_telegram_creds(
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+) -> tuple[str, str]:
+    token = (bot_token or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    cid = str(chat_id or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    return token, cid
+
+
+def _ask_telegram_help(
+    question: str,
+    *,
+    bot_token: str | None = None,
+    chat_id: str | None = None,
+) -> str:
     """Sends a question to Telegram and waits for a response from the human."""
-    print(f"[telegram] 🤖 Guy agent is stuck! Sending SOS to human: \"{question}\"")
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] ❌ ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env!")
+    token, cid = _resolve_telegram_creds(bot_token=bot_token, chat_id=chat_id)
+    print(f'[telegram] Sending to human: "{question}"')
+    if not token or not cid:
+        print("[telegram] ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in .env!")
         return "Human advisor is currently offline. You are on your own."
 
-    # 1. Send question
+    # 1. Flush old updates so we only see messages sent AFTER our question
     try:
-        print(f"[telegram] 📤 Sending to chat_id {TELEGRAM_CHAT_ID}...")
+        flush_resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": -1, "timeout": 0},
+            timeout=10,
+        ).json()
+        flush_results = flush_resp.get("result", [])
+        if flush_results:
+            last_update_id = flush_results[-1]["update_id"]
+        else:
+            last_update_id = 0
+        print(f"[telegram] Flushed old updates, starting after update_id={last_update_id}")
+    except Exception as e:
+        print(f"[telegram] Warning: flush failed ({e}), starting from 0")
+        last_update_id = 0
+
+    # 2. Send question
+    try:
+        print(f"[telegram] Sending to chat_id {cid}...")
         resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{token}/sendMessage",
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": f"🚨 ADVICE NEEDED for Guy:\n\n'{question}'",
+                "chat_id": cid,
+                "text": f"ADVICE NEEDED for Guy:\n\n'{question}'",
             },
             timeout=10,
         )
         if not resp.ok:
-            print(f"[telegram] ❌ Telegram API error: {resp.status_code} - {resp.text}")
+            print(f"[telegram] Telegram API error: {resp.status_code} - {resp.text}")
             return "Human advisor is currently unreachable."
-        print("[telegram] ✅ SOS sent successfully. Waiting for your reply on Telegram...")
+        sent_message_id = resp.json().get("result", {}).get("message_id")
+        print(f"[telegram] SOS sent (msg_id={sent_message_id}). Waiting for reply on Telegram...")
     except Exception as e:
-        print(f"[telegram] ❌ Exception during send: {e}")
+        print(f"[telegram] Exception during send: {e}")
         return f"Human advisor failed to respond: {e}"
 
-    # 2. Poll for reply
-    last_update_id = -1
+    # 3. Poll for reply — only accept messages AFTER our sent question
     t_start = time.time()
     while time.time() - t_start < 300:  # 5 minute timeout
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            url = f"https://api.telegram.org/bot{token}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 20}
             resp = requests.get(url, params=params, timeout=30).json()
 
             for update in resp.get("result", []):
                 last_update_id = update["update_id"]
                 msg = update.get("message")
-                if msg and str(msg["chat"]["id"]) == TELEGRAM_CHAT_ID and "text" in msg:
+                if not msg or str(msg.get("chat", {}).get("id")).strip() != cid:
+                    continue
+                # Skip our own bot message
+                if msg.get("message_id") == sent_message_id:
+                    continue
+                # Skip messages from bots (including ourselves)
+                if msg.get("from", {}).get("is_bot", False):
+                    continue
+                if "text" in msg:
                     text = msg["text"].strip()
-                    print(f"[telegram] 📥 HUMAN RESPONSE RECEIVED: \"{text}\"")
-                    return text
+                    if text:
+                        print(f'[telegram] HUMAN RESPONSE: "{text}"')
+                        return text
         except Exception as e:
-            print(f"[telegram] ⚠️ Polling error (retrying...): {e}")
+            print(f"[telegram] Polling error (retrying...): {e}")
         time.sleep(2)
 
-    print("[telegram] ⌛ Timeout: No human response after 5 minutes.")
+    print("[telegram] Timeout: No human response after 5 minutes.")
     return "Human advisor took too long to respond. Use your own intuition."
 
 
@@ -1460,6 +1547,21 @@ def _event_agent_id(event: dict[str, Any]) -> str:
     return ""
 
 
+def _compose_human_help_question(
+    *,
+    input_text: str,
+    relationship_stage: str,
+    reason: str,
+) -> str:
+    return (
+        "Need wingman advice for next reply.\n"
+        f"- Stage: {relationship_stage}\n"
+        f"- Trigger: {reason}\n"
+        f"- Their latest message: {input_text}\n"
+        "Give 2 concrete tactical suggestions and 1 short line I can send now."
+    )
+
+
 def run_turn_native(
     *,
     caller: MistralCaller,
@@ -1488,6 +1590,8 @@ def run_turn_native(
     use_web_hint = heuristic.use_web_search
     web_hint_reason = heuristic.web_search_reason
     use_human_hint = heuristic.use_human and agent_type == "man"
+    human_question = ""
+    human_advice = ""
 
     hints = {
         "consult_memory": use_memory_hint,
@@ -1504,6 +1608,14 @@ def run_turn_native(
         print(f"[hints] memory={use_memory_hint}, seduction={use_seduction_hint}, human={use_human_hint}")
         if use_human_hint:
             print(f"[hints] 🆘 Reason: {heuristic.human_reason}")
+            human_question = _compose_human_help_question(
+                input_text=input_text,
+                relationship_stage=relationship_stage,
+                reason=heuristic.human_reason,
+            )
+            # Deterministic consult path for duplex/native mode: do not rely on the model
+            # choosing to emit ask_human_help when consult_human is true.
+            human_advice = _ask_telegram_help(human_question)
 
     payload = {
         "input_text": input_text,
@@ -1515,6 +1627,12 @@ def run_turn_native(
         "hostility_reason": hostility_reason,
         "memory_candidates": memory_candidates,
         "handoff_hints": hints,
+        "human_advice": {
+            "requested": use_human_hint,
+            "question": human_question if use_human_hint else "",
+            "answer": human_advice if use_human_hint else "",
+            "reason": heuristic.human_reason if use_human_hint else "No human consultation requested.",
+        },
     }
     prep_ms = round((time.perf_counter() - prep_t0) * 1000, 1)
 
@@ -1676,6 +1794,10 @@ def run_turn_native(
         web_query=input_text if "web_search" in called_tools else "n/a",
         response_goal="Respond naturally while managing specialist handoffs.",
     )
+    human_called = bool(human_advice.strip()) or ("ask_human_help" in called_tools)
+    human_reason = (
+        heuristic.human_reason if use_human_hint else "Heuristic did not request human consultation."
+    )
 
     memory_called = "memory" in called_tools
     tool_calls = [
@@ -1690,11 +1812,24 @@ def run_turn_native(
             "called": "seduction" in called_tools,
             "reason": plan.seduction_reason,
         },
+        {
+            "tool": "human_help",
+            "called": human_called,
+            "reason": human_reason,
+        },
     ]
+    if human_called:
+        tool_outputs["human_help"] = {
+            "question": human_question,
+            "advice": human_advice,
+            "source": "direct_consult"
+            if bool(human_advice.strip())
+            else "native_tool_call",
+        }
 
     trace: dict[str, Any] = {
         "planning": ["Native Mistral handoff orchestration used."],
-        "tool_reasons": [plan.memory_reason, plan.web_search_reason, plan.seduction_reason],
+        "tool_reasons": [plan.memory_reason, plan.web_search_reason, plan.seduction_reason, human_reason],
         "model_thinking": {
             "planner": thinking,
             "final_reply": [],

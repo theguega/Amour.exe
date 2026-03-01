@@ -228,30 +228,6 @@ async def run_voice_loop(args) -> None:
     stt_silence = args.auto_silence_timeout_s if args.auto else args.silence_timeout_s
     print(f"[config] auto={args.auto} silence_timeout={stt_silence}s auto_delay={args.auto_delay}s")
 
-    if args.listen_first and not args.seed_text.strip():
-        if not args.auto:
-            await wait_for_spacebar("[press SPACE to start your first message]")
-        print("[stt] listen-first enabled: waiting for your input... (press B to stop)")
-        from voice_interaction.realtime_tts import listen_and_transcribe
-
-        stop_event = asyncio.Event()
-        key_task = asyncio.create_task(_watch_stop_key(stop_event))
-        try:
-            heard = await listen_and_transcribe(
-                silence_timeout_s=stt_silence,
-                noise_calibration_s=args.noise_calibration_s,
-                speech_ratio=args.speech_ratio,
-                stop_event=stop_event,
-            )
-        finally:
-            stop_event.set()
-            key_task.cancel()
-            try:
-                await key_task
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                pass
-        incoming = heard.strip() or _fallback_prompt("man" if args.type == "girl" else "girl")
-
     while args.max_turns <= 0 or turn_idx < args.max_turns:
         turn_idx += 1
         t_loop_top = time.perf_counter()
@@ -312,10 +288,7 @@ async def run_voice_loop(args) -> None:
         if args.auto:
             print(f"[turn {turn_idx}] auto-waiting {args.auto_delay}s before listening...")
             await asyncio.sleep(args.auto_delay)
-        else:
-            print(f"[turn {turn_idx}] waiting for spacebar...")
-            await wait_for_spacebar()
-
+            
         print(f"[turn {turn_idx}] starting STT... (press B to stop listening)")
         t_stt = time.perf_counter()
         stop_event = asyncio.Event()
