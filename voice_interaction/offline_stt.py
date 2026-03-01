@@ -32,7 +32,7 @@ def text_to_audio(text: str, voice_id: str) -> Path:
 
     try:
         audio_generator = client.text_to_speech.convert(
-            voice_id=voice_id, text=text, model_id="eleven_multilingual_v2"
+            voice_id=voice_id, text=text, model_id="eleven_flash_v2_5"
         )
 
         with open(audio_path, "wb") as f:
