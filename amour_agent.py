@@ -807,7 +807,20 @@ def _persona(agent_type: Literal["girl", "man"]) -> dict[str, str]:
 def _heuristic_plan(input_text: str) -> ToolPlan:
     t = input_text.lower()
     use_memory = any(k in t for k in ["remember", "last time", "you said", "favorite", "dream"])
-    use_web = "?" in t or any(k in t for k in ["what is", "how to", "why", "when", "where", "learn", "explain"])
+    # Only trigger web search for genuinely factual questions, not conversational ones like "what about you?"
+    factual_patterns = [
+        r"\bwhat is\b",
+        r"\bwho is\b",
+        r"\bhow to\b",
+        r"\bhow does\b",
+        r"\bhow do\b",
+        r"\bexplain\b",
+        r"\bdefine\b",
+        r"\btell me about\b",
+        r"\bwhat does .+ mean\b",
+        r"\blearn about\b",
+    ]
+    use_web = any(re.search(p, t) for p in factual_patterns)
     use_seduction = any(
         k in t
         for k in [
@@ -1232,6 +1245,24 @@ def run_turn_native(
         if {"reply", "short_rationale", "memory_update_candidate"} <= set(parsed.keys()):
             final_reply = FinalReply.model_validate(parsed)
             break
+        # Handle malformed structures: {"reply": {"response": "..."}} or {"reply": {"input_text": ..., "response": ...}}
+        reply_val = parsed.get("reply")
+        if isinstance(reply_val, dict):
+            extracted = reply_val.get("response") or reply_val.get("text") or reply_val.get("reply")
+            if isinstance(extracted, str) and extracted.strip():
+                final_reply = FinalReply(
+                    reply=extracted.strip(),
+                    short_rationale=str(parsed.get("short_rationale", "Extracted from nested reply structure.")),
+                    memory_update_candidate=str(parsed.get("memory_update_candidate", "")),
+                )
+                break
+        elif isinstance(reply_val, str) and reply_val.strip():
+            final_reply = FinalReply(
+                reply=reply_val.strip(),
+                short_rationale=str(parsed.get("short_rationale", "Extracted from partial FinalReply.")),
+                memory_update_candidate=str(parsed.get("memory_update_candidate", "")),
+            )
+            break
 
     if final_reply is None:
         for event in reversed(final_source_events):
@@ -1239,10 +1270,33 @@ def run_turn_native(
             if text:
                 # Never expose specialist/tool JSON as spoken reply.
                 maybe_json = _try_parse_json_block(text)
-                if isinstance(maybe_json, dict) and isinstance(maybe_json.get("tool"), str):
+                if isinstance(maybe_json, dict):
+                    if isinstance(maybe_json.get("tool"), str):
+                        continue
+                    # Try to extract reply text from any JSON structure
+                    for key in ("reply", "response", "text", "message"):
+                        val = maybe_json.get(key)
+                        if isinstance(val, str) and val.strip():
+                            final_reply = FinalReply(
+                                reply=val.strip(),
+                                short_rationale="Extracted from fallback JSON field.",
+                                memory_update_candidate="",
+                            )
+                            break
+                        if isinstance(val, dict):
+                            inner = val.get("response") or val.get("text") or val.get("reply")
+                            if isinstance(inner, str) and inner.strip():
+                                final_reply = FinalReply(
+                                    reply=inner.strip(),
+                                    short_rationale="Extracted from nested fallback JSON.",
+                                    memory_update_candidate="",
+                                )
+                                break
+                    if final_reply is not None:
+                        break
                     continue
                 final_reply = FinalReply(
-                    reply=text[:500],
+                    reply=text,
                     short_rationale="Native handoff fallback parsed from primary assistant text.",
                     memory_update_candidate="",
                 )
