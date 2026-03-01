@@ -411,8 +411,25 @@ def parse_args():
     return parser.parse_args()
 
 
+def _open_html(filename: str):
+    import os
+    import webbrowser
+    from pathlib import Path
+
+    html_path = Path(__file__).parent / filename
+    if os.path.exists(html_path):
+        webbrowser.open(html_path.as_uri())
+    else:
+        print(f"Warning: HTML file not found at {html_path}")
+
+
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.starter in ["man", "girl"]:
+        html_file = "guy.html" if args.starter == "man" else "girl.html"
+        _open_html(html_file)
+
     if args.benchmark_runs > 0:
         if not args.duplex:
             raise SystemExit("--benchmark-runs requires --duplex.")
