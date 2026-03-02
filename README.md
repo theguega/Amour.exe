@@ -1,120 +1,232 @@
+<p align="center">
+  <img src="assets/heart.png" alt="Amour.exe" width="80"/>
+</p>
 
-### **Hackathon Theme: "AI Love Story: The Voice Romance"**
-**Tagline:** *"Two computers, two voices, one love story—engineered in real time."*
+<h1 align="center">Amour.exe</h1>
 
-message.txt
-6 Ko
-﻿
-Here’s your updated hackathon theme, tailored for **two computers** with **real-time audio input/output** and **split-screen pixel art**:
+<p align="center">
+  <em>"Two computers, two voices, one love story — engineered in real time."</em>
+</p>
 
----
-
-### **Hackathon Theme: "AI Love Story: The Voice Romance"**
-**Tagline:** *"Two computers, two voices, one love story—engineered in real time."*
-
----
-
-### **Core Concept**
-Two AI agents, each running on separate computers, communicate via **real-time voice input/output**:
-- **Computer 1 (Girl)**: Pixel art "girl" character on screen, voice output via **ElevenLabs**.
-- **Computer 2 (Guy)**: Pixel art "guy" character on screen, voice output via **ElevenLabs**.
-- **Audio Input**: Both computers use **Voxtral** to capture real-time voice input (e.g., users can "whisper" to their AI or let them talk autonomously).
-- **Multi-Agent Handoff**: Agents can call external tools (e.g., memory, poetry, conflict resolution) to deepen the conversation.
-- **Self-Improving Prompts**: The system refines prompts dynamically to foster romantic progression.
-- **Tracking**: All interactions are logged in **Weights & Biases (W&B)** for analysis.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white" alt="Python 3.12+"/>
+  <img src="https://img.shields.io/badge/Mistral_AI-agents_%26_realtime-orange" alt="Mistral AI"/>
+  <img src="https://img.shields.io/badge/ElevenLabs-TTS-purple" alt="ElevenLabs"/>
+  <img src="https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white" alt="React"/>
+</p>
 
 ---
 
-### **Key Features**
+An AI-powered love story simulation where two agents — **Girl** and **Man** — fall in love through real-time voice conversation across two separate computers. Built with Mistral AI native agents, ElevenLabs TTS, Voxtral STT, and a retro pixel-art interface.
 
-#### 1. **Dual-Computer Setup**
-   - **Computer 1 (Girl)**:
-     - Screen: Pixel art "girl" character (animated, e.g., blushing, smiling).
-     - Voice: ElevenLabs TTS (female voice).
-     - Input: Voxtral for real-time audio capture (user can speak to the AI or let it auto-respond).
-   - **Computer 2 (Guy)**:
-     - Screen: Pixel art "guy" character (animated, e.g., nervous, confident).
-     - Voice: ElevenLabs TTS (male voice).
-     - Input: Voxtral for real-time audio capture.
+<p align="center">
+  <img src="assets/girl.png" alt="Girl character" width="200"/>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/heart.png" alt="heart" width="60"/>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/guy.png" alt="Guy character" width="200"/>
+</p>
 
-#### 2. **Real-Time Voice Interaction**
-   - **Workflow**:
-     1. Computer 1’s AI speaks (ElevenLabs → speaker).
-     2. Computer 2’s Voxtral captures the audio, transcribes it, and sends it to its AI.
-     3. Computer 2’s AI responds (ElevenLabs → speaker).
-     4. Repeat.
-   - **Fallback**: If no user input, agents auto-generate responses based on their traits.
+## How It Works
 
-#### 3. **Multi-Agent Handoff**
-   - Agents can "call" external tools to enhance the conversation:
-     - **Memory Agent**: "Remember when you said you loved jazz?"
-     - **Poetry Agent**: Generates a love poem on the fly.
-     - **Conflict Resolver**: Mediates if the conversation turns sour.
-   - Handoffs are triggered by keywords or sentiment drops.
+Each agent runs on a separate computer with its own pixel-art character on screen. They speak aloud via **ElevenLabs** and listen via **Voxtral** real-time speech-to-text. Under the hood, a multi-agent orchestration system drives the conversation forward through a relationship state machine:
 
-#### 4. **Self-Improving Prompts**
-   - After each exchange, the system evaluates:
-     - Sentiment score (e.g., using NLP libraries).
-     - Keyword usage (e.g., "love," "trust," "future").
-   - Prompts are adjusted to encourage deeper connection:
-     - *"Ask about their childhood."*
-     - *"Share a secret."*
+```
+strangers → curious → flirty → bonded → in_love
+```
 
-#### 5. **Weights & Biases Tracking**
-   - Log everything:
-     - **Prompts**: What each AI was asked to say.
-     - **Responses**: What they actually said.
-     - **Sentiment**: Score for each exchange.
-     - **Handoffs**: Which tools were called and why.
-   - Visualize the "romantic progression" in W&B dashboards.
+Agents can delegate to specialized sub-agents mid-conversation:
 
-#### 6. **Pixel Art Interface**
-   - **Computer 1**: Girl character + text/audio bubbles.
-   - **Computer 2**: Guy character + text/audio bubbles.
-   - **Animations**: Subtle changes (e.g., hearts, blushing) based on sentiment.
+| Sub-Agent | Role |
+|-----------|------|
+| **Memory** | Recalls past facts to build continuity ("Remember when you said you loved jazz?") |
+| **Seduction** | Romantic strategy & charm lines, adapted to the current relationship stage |
+| **Web Search** | Wikipedia lookups for factual questions that come up naturally |
 
----
+Every turn is scored for **sentiment** and **emotion** (joy, curiosity, nervousness, sadness, anger), which feeds back into the relationship progression and is tracked live in a **Weights & Biases** dashboard.
 
-### **Technical Stack**
-| Component          | Tool/Tech                          |
-|--------------------|------------------------------------|
-| Voice Input        | Voxtral (real-time audio capture) |
-| Voice Output       | ElevenLabs TTS                     |
-| AI Agents          | Your existing multi-agent framework|
-| Prompt Engineering | Dynamic prompt generation          |
-| Tracking           | Weights & Biases                   |
-| Frontend           | Pygame/HTML Canvas for pixel art   |
+<p align="center">
+  <img src="assets/room.png" alt="Room background" width="600"/>
+</p>
 
----
+## Tech Stack
 
-### **Example Workflow**
-1. **Computer 1 (Girl AI)**: *"I’ve always wondered… do you think love is just chemistry, or something more?"* (ElevenLabs voice).
-2. **Computer 2 (Guy AI)**: Voxtral captures audio, transcribes: *"Chemistry is just the start. Let me ask the Poetry Agent to explain."* (calls external tool).
-3. **Poetry Agent**: *"Love is the collision of two chaotic orbits, defying entropy."*
-4. **Computer 1 (Girl AI)**: *"That’s beautiful. Tell me more about your orbits."* (sentiment score rises; prompt adjusts to encourage vulnerability).
+| Component | Technology |
+|-----------|-----------|
+| AI Agents | [Mistral AI](https://mistral.ai/) — native agent orchestration with server-side handoffs |
+| Voice Output (TTS) | [ElevenLabs](https://elevenlabs.io/) |
+| Voice Input (STT) | Voxtral (Mistral realtime API) |
+| Relationship Tracking | [Weights & Biases (Weave)](https://wandb.ai/) |
+| Frontend | HTML5 pixel-art UIs + React dashboard with Chart.js |
+| Communication | WebSockets (real-time state broadcast) |
+| Audio | PyAudio + Pygame |
 
----
+## Getting Started
 
-### **Judging Criteria**
-1. **Real-Time Fluidity**: How seamless is the voice interaction?
-2. **Romantic Progression**: Do the AIs develop a convincing connection?
-3. **Creativity**: How unique are the personalities and handoffs?
-4. **Tracking**: How well does W&B visualize the "love story"?
-5. **User Experience**: Is the dual-screen pixel art engaging?
+### Prerequisites
 
----
+- Python 3.12+
+- [uv](https://github.com/astral-sh/uv) package manager
+- Node.js (for the dashboard)
+- API keys for Mistral AI, ElevenLabs, and Weights & Biases
 
-### **Stretch Goals**
-- Add a "mood ring" visualization that changes color based on sentiment.
-- Let users "nudge" their AI (e.g., whisper advice via Voxtral).
-- Implement a "breakup" mechanic if sentiment drops too low.
+### Installation
 
----
+```bash
+# Clone the repo
+git clone https://github.com/your-org/Amour.exe.git
+cd Amour.exe
 
-### **Why This Works**
-- **Technical Challenge**: Real-time audio + multi-agent handoff + dynamic prompts.
-- **Whimsical**: A fun twist on AI romance with a retro pixel art aesthetic.
-- **Scalable**: Uses your existing codebase with clear extensions.
+# Install system dependency (macOS)
+brew install pyaudio
 
-Want to dive deeper into the **Voxtral/ElevenLabs integration** or **pixel art animation**? Or should we sketch out the W&B tracking schema?
-message.txt
+# Install Python dependencies
+uv sync
+
+# Install dashboard dependencies
+cd dashboard && npm install && cd ..
+```
+
+### Configuration
+
+Create a `.env` file at the project root:
+
+```env
+MISTRAL_API_KEY=your_mistral_key
+ELEVENLABS_API_KEY=your_elevenlabs_key
+WANDB_API_KEY=your_wandb_key
+```
+
+## Usage
+
+### Single Agent (Voice Mode)
+
+Run one agent on each computer. They talk and listen through the speakers/microphone:
+
+```bash
+# Computer 1
+python main.py --type girl
+
+# Computer 2
+python main.py --type man
+```
+
+Use `--auto` to automatically start listening after speaking (for the two-computer setup):
+
+```bash
+python main.py --type girl --auto --auto-delay 2.5
+```
+
+### Duplex Mode (Both Agents Locally)
+
+Run both agents on a single machine for testing — they converse via text with no audio:
+
+```bash
+python main.py --duplex --max-turns 20
+```
+
+### Replay Mode
+
+Replay a recorded conversation with optional voice playback:
+
+```bash
+python main.py --replay --replay-session-id voice-session
+```
+
+### Benchmark Mode
+
+Run multiple simulations and measure relationship progression metrics:
+
+```bash
+python main.py --duplex --benchmark-runs 5
+```
+
+### Dashboard
+
+Real-time visualization of emotions, sentiment, and relationship progression:
+
+```bash
+cd dashboard
+npm run dev
+```
+
+### Key Flags
+
+| Flag | Description |
+|------|-------------|
+| `--type [girl\|man]` | Which agent to run |
+| `--duplex` | Run both agents locally |
+| `--auto` | Auto-listen after speaking |
+| `--auto-delay N` | Seconds to wait before listening (avoid echo) |
+| `--girl-mood [neutral\|open\|rejection]` | Girl personality override |
+| `--man-mood [neutral\|open\|rejection]` | Man personality override |
+| `--max-turns N` | Limit conversation length |
+| `--disable-weave` | Disable W&B tracing |
+| `--reset-memory` | Clear session memory |
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                     main.py                          │
+│         Voice Runtime & WebSocket Server             │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  ┌─────────────┐    WebSocket     ┌──────────────┐  │
+│  │  girl.html   │ ◄────────────► │  dashboard/   │  │
+│  │  guy.html    │    (port 8080)  │  (React app)  │  │
+│  └─────────────┘                  └──────────────┘  │
+│                                                      │
+├──────────────────────────────────────────────────────┤
+│                  amour_agent.py                       │
+│            Agent Core & Orchestration                 │
+│                                                      │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  Memory   │  │  Seduction   │  │  Web Search  │  │
+│  │  Agent    │  │  Agent       │  │  Agent       │  │
+│  └──────────┘  └──────────────┘  └──────────────┘  │
+│                                                      │
+├──────────────────────────────────────────────────────┤
+│              voice_interaction/                        │
+│  ┌──────────────────┐  ┌───────────────────────┐    │
+│  │  ElevenLabs TTS   │  │  Voxtral STT          │    │
+│  │  (offline_stt.py) │  │  (realtime_tts.py)    │    │
+│  └──────────────────┘  └───────────────────────┘    │
+└──────────────────────────────────────────────────────┘
+```
+
+## Relationship Model
+
+The relationship progresses through five stages based on the Girl's interest score (0.0 → 1.0):
+
+| Score | Stage | Description |
+|-------|-------|-------------|
+| 0.0 – 0.2 | **Strangers** | Initial awkward small talk |
+| 0.2 – 0.4 | **Curious** | Growing interest, asking questions |
+| 0.4 – 0.6 | **Flirty** | Playful banter, compliments |
+| 0.6 – 0.8 | **Bonded** | Deeper emotional connection |
+| 0.8 – 1.0 | **In Love** | Full romantic attachment |
+
+Sentiment analysis, memory usage, and seduction tool calls all influence the score. The Guy's confidence (starts at 1.0) fluctuates based on the Girl's reception.
+
+## Project Structure
+
+```
+Amour.exe/
+├── main.py                 # Voice runtime, WebSocket server, CLI entry point
+├── amour_agent.py          # Agent logic, handoffs, relationship state machine
+├── voice_interaction/
+│   ├── offline_stt.py      # ElevenLabs TTS wrapper
+│   └── realtime_tts.py     # Voxtral real-time STT
+├── assets/                 # Pixel art sprites & backgrounds
+├── dashboard/              # React + Chart.js analytics dashboard
+├── girl.html               # Girl character pixel-art UI
+├── guy.html                # Guy character pixel-art UI
+├── logs/                   # Conversation logs, memory, benchmarks
+├── audio_cache/            # Cached TTS audio (MD5-hashed)
+└── docs/                   # Design docs & references
+```
+
+## License
+
+Built at a hackathon with love (and a lot of Mistral API calls).

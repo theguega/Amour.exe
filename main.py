@@ -438,82 +438,108 @@ def _load_replay_rows(
 
 
 async def run_replay_loop(args) -> None:
-    asyncio.create_task(start_ws_server())
-    replay_path = Path(args.replay_log_file)
-    rows = _load_replay_rows(
-        replay_path,
-        args.replay_session_id,
-        args.max_turns,
-        args.replay_all_matches,
-        args.replay_offset,
+    replay_with_voice = (
+        args.replay
+        and args.replay_session_id == "voice-session"
+        and args.max_turns == 40
+        and abs(args.replay_speed - 2.2) < 1e-9
     )
+    if replay_with_voice:
+        from voice_interaction.offline_stt import text_to_audio
 
-    if args.replay_start_stage:
-        stages = ["strangers", "curious", "flirty", "bonded", "in_love"]
-        target = args.replay_start_stage.strip().lower()
-        if target in stages and args.replay_offset == 0:
-            target_idx = stages.index(target)
-            cut_idx = None
-            for i, row in enumerate(rows):
-                stage = str(row.get("relationship", {}).get("stage", "strangers")).lower()
-                stage_idx = stages.index(stage) if stage in stages else 0
-                if stage_idx >= target_idx:
-                    cut_idx = i
-                    break
-            if cut_idx is not None and cut_idx > 0:
-                rows = rows[cut_idx:]
-                print(f"[replay] trimmed first {cut_idx} rows; starting at stage>={target}")
-
-    if not rows:
-        raise SystemExit(
-            f"No replay turns found in {replay_path} "
-            f"(session_id={args.replay_session_id or 'any'})."
+    ws_task = asyncio.create_task(start_ws_server())
+    try:
+        replay_path = Path(args.replay_log_file)
+        rows = _load_replay_rows(
+            replay_path,
+            args.replay_session_id,
+            args.max_turns,
+            args.replay_all_matches,
+            args.replay_offset,
         )
 
-    print(
-        f"[replay] rows={len(rows)} log={replay_path} "
-        f"session={args.replay_session_id or 'any'} speed={args.replay_speed}x"
-    )
-    await asyncio.sleep(max(0.0, args.replay_start_delay))
+        if args.replay_start_stage:
+            stages = ["strangers", "curious", "flirty", "bonded", "in_love"]
+            target = args.replay_start_stage.strip().lower()
+            if target in stages and args.replay_offset == 0:
+                target_idx = stages.index(target)
+                cut_idx = None
+                for i, row in enumerate(rows):
+                    stage = str(row.get("relationship", {}).get("stage", "strangers")).lower()
+                    stage_idx = stages.index(stage) if stage in stages else 0
+                    if stage_idx >= target_idx:
+                        cut_idx = i
+                        break
+                if cut_idx is not None and cut_idx > 0:
+                    rows = rows[cut_idx:]
+                    print(f"[replay] trimmed first {cut_idx} rows; starting at stage>={target}")
 
-    for idx, row in enumerate(rows, 1):
-        agent_type = row["agent_type"]
-        text = str(row.get("response", "")).strip()
-        if not text:
-            continue
-        rel = row.get("relationship", {})
-
-        default_compat = 0.0 if agent_type == "girl" else 1.0
-        think_s = max(
-            0.25,
-            min(1.8, (len(text) * 0.02) / max(args.replay_speed, 0.1)),
-        )
-        speak_s = max(
-            1.0,
-            min(4.0, (len(text) * 0.05) / max(args.replay_speed, 0.1)),
-        )
-        gap_s = max(0.1, args.replay_gap_s / max(args.replay_speed, 0.1))
+        if not rows:
+            raise SystemExit(
+                f"No replay turns found in {replay_path} "
+                f"(session_id={args.replay_session_id or 'any'})."
+            )
 
         print(
-            f"[replay turn {idx}] agent={agent_type} stage={rel.get('stage', 'strangers')} "
-            f"text_len={len(text)}"
+            f"[replay] rows={len(rows)} log={replay_path} "
+            f"session={args.replay_session_id or 'any'} speed={args.replay_speed}x"
         )
-        await broadcast({"action": "typing", "agent_type": agent_type})
-        await asyncio.sleep(think_s)
-        await broadcast({"action": "stop_typing", "agent_type": agent_type})
-        await broadcast({"action": "speech", "agent_type": agent_type, "text": text})
-        await broadcast({
-            "action": "sentiment",
-            "agent_type": agent_type,
-            "compatibility": rel.get("compatibility_score", default_compat),
-            "stage": rel.get("stage", "strangers"),
-            "trend": rel.get("trend", "stable"),
-        })
-        await asyncio.sleep(speak_s)
-        await broadcast({"action": "stop_typing", "agent_type": agent_type})
-        await asyncio.sleep(gap_s)
+        if replay_with_voice:
+            print("[replay] voice mode enabled for this run (ElevenLabs playback).")
+        await asyncio.sleep(max(0.0, args.replay_start_delay))
 
-    print("[replay] complete")
+        for idx, row in enumerate(rows, 1):
+            agent_type = row["agent_type"]
+            text = str(row.get("response", "")).strip()
+            if not text:
+                continue
+            rel = row.get("relationship", {})
+
+            default_compat = 0.0 if agent_type == "girl" else 1.0
+            think_s = max(
+                0.25,
+                min(1.8, (len(text) * 0.02) / max(args.replay_speed, 0.1)),
+            )
+            speak_s = max(
+                1.0,
+                min(4.0, (len(text) * 0.05) / max(args.replay_speed, 0.1)),
+            )
+            gap_s = max(0.1, args.replay_gap_s / max(args.replay_speed, 0.1))
+
+            print(
+                f"[replay turn {idx}] agent={agent_type} stage={rel.get('stage', 'strangers')} "
+                f"text_len={len(text)}"
+            )
+            await broadcast({"action": "typing", "agent_type": agent_type})
+            await asyncio.sleep(think_s)
+            await broadcast({"action": "stop_typing", "agent_type": agent_type})
+            await broadcast({"action": "speech", "agent_type": agent_type, "text": text})
+            await broadcast({
+                "action": "sentiment",
+                "agent_type": agent_type,
+                "compatibility": rel.get("compatibility_score", default_compat),
+                "stage": rel.get("stage", "strangers"),
+                "trend": rel.get("trend", "stable"),
+            })
+            if replay_with_voice:
+                try:
+                    audio_path = await asyncio.to_thread(text_to_audio, text, VOICE_IDS[agent_type])
+                    await play_audio(audio_path)
+                except Exception as exc:
+                    print(
+                        f"[replay turn {idx}] TTS/playback failed ({type(exc).__name__}: {exc}); "
+                        "falling back to timed replay."
+                    )
+                    await asyncio.sleep(speak_s)
+            else:
+                await asyncio.sleep(speak_s)
+            await broadcast({"action": "stop_typing", "agent_type": agent_type})
+            await asyncio.sleep(gap_s)
+
+        print("[replay] complete")
+    finally:
+        ws_task.cancel()
+        await asyncio.gather(ws_task, return_exceptions=True)
 
 
 async def run_duplex_benchmark(args) -> None:
